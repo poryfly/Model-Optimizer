@@ -22,6 +22,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import transformer_engine as te
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.gpt import GPTModel
@@ -265,6 +266,27 @@ class _DynamicFusedLayerNorm(_DynamicLayerNorm):
         self._register_dynamic_attribute("weight", self._cut_to_active_features)
         self._register_dynamic_attribute("bias", self._cut_to_active_features)
         self._register_dynamic_attribute("hidden_size", self._get_normalized_shape)
+
+
+# TE Normalization DynamicModule ###################################################################
+# Register a TENorm for ``transformer_engine.pytorch.RMSNorm`` (and ``te.pytorch.LayerNorm``) so
+# that models which use Transformer-Engine norm layers (e.g. DeepSeek-V4's RMSNorm inside
+# ``_DynamicHyperConnectionTransformerLayer``) can be converted into dynamic space.  We intentionally
+# keep both the FusedLayerNorm registration above (for Megatron-Core's fused norm) and the TENorm
+# registration here (for TE's norm).
+@DMRegistry.register(
+    {te.pytorch.LayerNorm: "te.pytorch.LayerNorm", te.pytorch.RMSNorm: "te.pytorch.RMSNorm"}
+)
+class _DynamicTENorm(_DynamicLayerNorm):
+    """A ``te.pytorch.{Layer/RMS}Norm`` layer with dynamic hyperparams."""
+
+    def _setup(self, *, num_features: TracedHp):
+        """Setup the TENorm dynamic module with pre-defined num_features hparam."""
+        self._register_hparam("num_features", num_features)
+        # register dynamic attributes
+        self._register_dynamic_attribute("weight", self._cut_to_active_features)
+        if hasattr(self, "bias"):  # Bias is not present in RMSNorm
+            self._register_dynamic_attribute("bias", self._cut_to_active_features)
 
 
 # MLP DynamicModule ################################################################################
