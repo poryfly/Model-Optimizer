@@ -49,11 +49,16 @@ def prune(
                 required for FastNAS pruning & search. The mode's config
                 is described in :class:`FastNASConfig<modelopt.torch.prune.config.FastNASConfig>`.
                 This mode is recommended to prune Computer Vision models.
+            *   :class:`"gradnas"<modelopt.torch.prune.gradnas.GradNASModeDescriptor>`: The ``model`` will
+                be converted into a search space and set up to automatically perform operations
+                required for gradient-based pruning & search. The mode's config
+                is described in :class:`GradNASConfig<modelopt.torch.prune.config.GradNASConfig>`.
+                This mode is recommended to prune Hugging Face language models like BERT and GPT-J.
             *   :class:`"mcore_minitron"<modelopt.torch.prune.plugins.mcore_minitron.MCoreMinitronModeDescriptor>`: The ``model``
                 will be converted into a search space and set up to automatically perform operations
                 required for Minitron-style pruning & search. The mode's config
                 is described in :class:`MCoreMinitronConfig<modelopt.torch.prune.config.MCoreMinitronConfig>`.
-                This mode is required to prune NVIDIA Megatron-Core GPT or Mamba models.
+                This mode is required to prune NVIDIA Megatron-Core / NeMo GPT-type models.
 
             If the mode argument is specified as a dictionary, the keys should indicate the mode and
             the values specify the per-mode configuration. If not provided, then default
@@ -73,7 +78,7 @@ def prune(
                     constraints = {"params": "60%"}
 
                     # Specify export_config with pruned hyperparameters
-                    # This is supported only if the model is converted via ``mcore_minitron`` mode.
+                    # This is supported and required if the model is converted via ``mcore_minitron`` mode.
                     constraints = {
                         "export_config": {
                             "ffn_hidden_size": 128,
@@ -155,6 +160,28 @@ def prune(
 
                     The ``score_func`` is required only for ``fastnas`` mode. It will be
                     evaluated on models in eval mode (``model.eval()``).
+            * ``loss_func``: A ``Callable`` which takes the model output (i.e output of ``model.forward()``)
+              and the batch of data as its inputs and returns a scalar loss.
+              This is a required argument if the model is converted via ``gradnas`` mode.
+
+              It should be possible to run a backward pass on the loss value returned by this method.
+
+              ``collect_func`` will be used to gather the inputs to ``model.forward()``
+              from a batch of data yielded by``data_loader``.
+
+              ``loss_func`` should support the following usage:
+
+                .. code-block:: python
+
+                    for i, batch in enumerate(data_loader):
+                        if i >= max_iter_data_loader:
+                            break
+
+                        # Assuming collect_func returns a tuple of arguments
+                        output = model(*collect_func(batch))
+
+                        loss = loss_func(output, batch)
+                        loss.backward()
 
             .. note::
 

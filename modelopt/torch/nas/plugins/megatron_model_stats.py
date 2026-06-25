@@ -115,6 +115,94 @@ def _attn_layer_params(
     return params
 
 
+def _mla_attn_layer_params(
+    hidden_size: int,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    num_attention_heads: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    qk_rope_head_dim: int,
+    add_bias_linear: bool,
+    normalization: str,
+    o_lora_rank: int | None = None,
+    o_groups: int | None = None,
+    compress_ratio: int = 0,
+    index_n_heads: int = 0,
+    index_head_dim: int = 0,
+) -> int:
+    """Params for a single V4 MLA attention sublayer.
+
+    Includes separate input_layernorm, Q/KV down/up projections, output projection,
+    and optional O-LoRA, compressor, and indexer parameters.
+    """
+    # Separate input_layernorm (not fused into QKV)
+    params = _norm_params(hidden_size, normalization)
+
+    # Q down-projection: hidden_size -> q_lora_rank
+    params += hidden_size * q_lora_rank
+    if add_bias_linear:
+        params += q_lora_rank
+
+    # Q up-projection: q_lora_rank -> num_heads * (qk_head_dim + qk_rope_head_dim)
+    q_up_out = num_attention_heads * (qk_head_dim + qk_rope_head_dim)
+    params += q_lora_rank * q_up_out
+    if add_bias_linear:
+        params += q_up_out
+
+    # KV down-projection: hidden_size -> kv_lora_rank + qk_rope_head_dim
+    kv_down_out = kv_lora_rank + qk_rope_head_dim
+    params += hidden_size * kv_down_out
+    if add_bias_linear:
+        params += kv_down_out
+
+    # KV up-projection: kv_lora_rank -> num_heads * (qk_head_dim + v_head_dim)
+    kv_up_out = num_attention_heads * (qk_head_dim + v_head_dim)
+    params += kv_lora_rank * kv_up_out
+    if add_bias_linear:
+        params += kv_up_out
+
+    # Output projection
+    if o_lora_rank is not None and o_lora_rank > 0:
+        # O-LoRA: o_down (num_heads * v_head_dim -> o_lora_rank) + o_up (o_lora_rank -> hidden_size)
+        o_down_in = num_attention_heads * v_head_dim
+        params += o_down_in * o_lora_rank
+        if add_bias_linear:
+            params += o_lora_rank
+        if o_groups and o_groups > 1:
+            params += o_lora_rank * hidden_size * o_groups
+        else:
+            params += o_lora_rank * hidden_size
+        if add_bias_linear:
+            params += hidden_size
+    else:
+        # Standard output projection: (num_heads * v_head_dim) -> hidden_size
+        params += num_attention_heads * v_head_dim * hidden_size
+        if add_bias_linear:
+            params += hidden_size
+
+    # Compressor parameters (CSA: ratio > 1, HCA: ratio > 1)
+    if compress_ratio > 1:
+        comp_dim = kv_lora_rank + qk_rope_head_dim
+        # Compressor: ape (positional), wkv, wgate, norm
+        params += comp_dim  # ape
+        params += comp_dim * comp_dim  # wkv
+        params += comp_dim * comp_dim  # wgate
+        params += _norm_params(comp_dim, normalization)  # norm
+
+    # Indexer parameters (CSA only: ratio > 1 with indexer)
+    if index_n_heads > 0 and index_head_dim > 0:
+        indexer_dim = index_n_heads * index_head_dim
+        params += q_lora_rank * indexer_dim  # wq_b
+        params += indexer_dim * _norm_params(indexer_dim, normalization)  # weights_proj + norm
+        # Indexer has its own small compressor
+        comp_dim = kv_lora_rank + qk_rope_head_dim
+        params += comp_dim  # ape
+        params += comp_dim * comp_dim  # wkv
+
+    return params
+
+
 def _dense_mlp_params(
     hidden_size: int,
     ffn_hidden_size: int,
@@ -318,28 +406,70 @@ def mcore_param_count(
     if not share_embeddings_and_output_weights:
         base += hidden_size * vocab_size
 
+    # Hyper-Connection global parameters (V4 only)
+    hc_mult: int = _get("hc_mult", 0)
+    if hc_mult > 0:
+        # Global HC head params: hc_head_fn, hc_head_base, hc_head_scale
+        # Per-layer HC: hc_attn_fn/base/scale + hc_ffn_fn/base/scale = 6 scalars per layer
+        base += 3 * hc_mult  # global hc_head params
+        base += 6 * num_layers * hc_mult  # per-layer HC params (counted in base for simplicity)
+
     total = base
     active = base
 
     if hybrid_layer_pattern is None:
         # ---- Pure GPT: all layers have attention + dense-MLP or attention + MoE ----
         assert kv_channels is not None, "kv_channels must be set for GPT attention layers"
+
+        # Detect V4 model by presence of compress_ratios
+        compress_ratios: list[int] | None = _get("compress_ratios")
+        q_lora_rank: int | None = _get("q_lora_rank")
+        kv_lora_rank: int | None = _get("kv_lora_rank")
+        qk_head_dim: int = _get("qk_head_dim", kv_channels)
+        v_head_dim: int = _get("v_head_dim", kv_channels)
+        qk_rope_head_dim: int = _get("qk_rope_head_dim", 0)
+        o_lora_rank: int | None = _get("o_lora_rank")
+        o_groups: int | None = _get("o_groups")
+        index_n_heads: int = _get("index_n_heads", 0)
+        index_head_dim: int = _get("index_head_dim", 0)
+
+        is_v4 = compress_ratios is not None and q_lora_rank is not None
+
         if isinstance(moe_layer_freq, list):
             moe_pattern = list(moe_layer_freq[:num_layers])
         else:
             moe_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
 
         for i in range(num_layers):
-            layer_t = layer_a = _attn_layer_params(
-                hidden_size,
-                num_attention_heads,
-                num_query_groups,
-                kv_channels,
-                add_bias_linear,
-                normalization,
-                qk_layernorm,
-                attention_output_gate,
-            )
+            if is_v4:
+                ratio = compress_ratios[i] if i < len(compress_ratios) else 0
+                layer_t = layer_a = _mla_attn_layer_params(
+                    hidden_size,
+                    q_lora_rank,
+                    kv_lora_rank,
+                    num_attention_heads,
+                    qk_head_dim,
+                    v_head_dim,
+                    qk_rope_head_dim,
+                    add_bias_linear,
+                    normalization,
+                    o_lora_rank=o_lora_rank,
+                    o_groups=o_groups,
+                    compress_ratio=ratio,
+                    index_n_heads=index_n_heads if ratio == 4 else 0,
+                    index_head_dim=index_head_dim if ratio == 4 else 0,
+                )
+            else:
+                layer_t = layer_a = _attn_layer_params(
+                    hidden_size,
+                    num_attention_heads,
+                    num_query_groups,
+                    kv_channels,
+                    add_bias_linear,
+                    normalization,
+                    qk_layernorm,
+                    attention_output_gate,
+                )
             if moe_pattern[i] and num_moe_experts:
                 assert moe_ffn_hidden_size is not None, (
                     "moe_ffn_hidden_size must be set for MoE layers"
@@ -539,6 +669,10 @@ def mcore_memory_footprint_mb(
     if kv_channels is None and num_attention_heads:
         kv_channels = hidden_size // num_attention_heads
 
+    # V4 MLA uses compressed KV cache
+    kv_lora_rank: int | None = _get("kv_lora_rank")
+    qk_rope_head_dim: int = _get("qk_rope_head_dim", 0)
+
     # Parameter memory
     total_params, _ = mcore_param_count(
         config,
@@ -562,11 +696,15 @@ def mcore_memory_footprint_mb(
     # each tensor: [batch_size, sequence_length, num_query_groups, kv_channels]
     kv_bytes = 0
     if n_attn > 0:
-        if num_query_groups is None or kv_channels is None:
-            raise ValueError(
-                "num_query_groups and kv_channels must be set when attention layers exist."
-            )
-        kv_per_layer = 2 * batch_size * sequence_length * num_query_groups * kv_channels
+        if kv_lora_rank is not None and kv_lora_rank > 0:
+            # V4 MLA: compressed KV cache uses kv_lora_rank + qk_rope_head_dim per token
+            kv_per_layer = 2 * batch_size * sequence_length * (kv_lora_rank + qk_rope_head_dim)
+        else:
+            if num_query_groups is None or kv_channels is None:
+                raise ValueError(
+                    "num_query_groups and kv_channels must be set when attention layers exist."
+                )
+            kv_per_layer = 2 * batch_size * sequence_length * num_query_groups * kv_channels
         kv_bytes = n_attn * kv_per_layer * kv_cache_dtype_bytes
 
     # Mamba recurrent state per layer (both caches needed for autoregressive generation):
