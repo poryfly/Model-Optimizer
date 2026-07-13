@@ -79,6 +79,13 @@ except ImportError:
 from modelopt.torch.utils.plugins.megatron_calibration import get_megatron_calibration_forward_loop
 
 
+# Module-level reference captured from megatron.core.models.gpt.gpt_layer_specs
+# at monkey-patch time. Used by _rebuild_mtp_after_prune to restore the
+# original helper so we can re-derive a real mtp_block_spec on the last PP
+# rank after calibration is done. Initialized lazily in main().
+_ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND = None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Prune DeepSeek-V4 model",
@@ -111,6 +118,16 @@ def parse_args():
         type=int,
         default=None,
         help="Target shared expert width",
+    )
+    parser.add_argument(
+        "--num_mtp_layers",
+        type=int,
+        default=None,
+        help=(
+            "Target num_nextn_predict_layers (MTP). Default None means read "
+            "from the HF source config (DeepSeek-V4-Flash = 1). Set to 0 to "
+            "disable MTP in the pruned artifact."
+        ),
     )
 
     parser.add_argument(
@@ -441,7 +458,158 @@ def _compute_pruned_validation_loss(
     return float(sum(losses) / len(losses)), len(losses)
 
 
-def _apply_v4_post_prune_slicing(model, export_config, hidden_size_order=None):
+def _rebuild_mtp_after_prune(
+    unwrapped_model,
+    bridge,
+    hf_model_name_or_path,
+    pp_rank,
+    pp_size,
+    n_mtp,
+):
+    """Path C: rebuild MTP block on the last PP rank after pruning.
+
+    During calibration, get_gpt_mtp_block_spec_for_backend is monkey-patched
+    to return None, so the pruned GPTModel is constructed without `mtp`. This
+    function runs after prune + decoder slicing:
+
+      1. Restore the original get_gpt_mtp_block_spec_for_backend helper.
+      2. Re-derive the V4 TransformerBlockSubmodules using the pruned config.
+      3. Construct MultiTokenPredictionBlock and attach to unwrapped_model.
+      4. Re-run Bridge's HF→Megatron weight loader to populate MTP weights.
+
+    Only the last PP rank executes the rebuild (MTP must live on the last PP
+    stage due to MCore's is_vp_last_stage assertion). Other ranks no-op.
+
+    After this function returns, unwrapped_model.mtp is set and its weights
+    still retain the *original* (pre-prune) shapes — caller must run
+    _apply_v4_post_prune_slicing(..., n_mtp_after=n_mtp) afterwards to slice
+    MTP weights to target_hidden_size / target_n_experts / target_moe_ffn.
+    """
+    if n_mtp <= 0:
+        print_rank_0("[MTP rebuild] n_mtp=0, skipping MTP rebuild")
+        return
+    if pp_rank != pp_size - 1:
+        print_rank_0(
+            f"[MTP rebuild] pp_rank={pp_rank} is not last stage "
+            f"(pp_size={pp_size}), skipping"
+        )
+        return
+
+    # ── Step 1: restore the original helper ──────────────────────────
+    import megatron.core.models.gpt.gpt_layer_specs as _gpt_specs
+
+    if _ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND is None:
+        raise RuntimeError(
+            "_ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND not captured at patch time"
+        )
+    _gpt_specs.get_gpt_mtp_block_spec_for_backend = (
+        _ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND
+    )
+
+    # ── Step 2: re-derive V4 TransformerBlockSubmodules ──────────────
+    # Import the experimental spec helper; it materializes a
+    # TransformerBlockSubmodules (not a callable) which the helper accepts.
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_transformer_block_with_experimental_attention_variant_spec as _get_exp_attn_spec,
+    )
+    from megatron.core.extensions.transformer_engine_spec_provider import (
+        TESpecProvider,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.core.transformer.multi_token_prediction import (
+        MultiTokenPredictionBlock,
+    )
+
+    cfg = unwrapped_model.config
+    print_rank_0(
+        f"[MTP rebuild] deriving V4 spec from pruned config: "
+        f"hidden_size={cfg.hidden_size}, num_layers={cfg.num_layers}, "
+        f"num_moe_experts={getattr(cfg, 'num_moe_experts', None)}, "
+        f"mtp_num_layers={getattr(cfg, 'mtp_num_layers', None)}, "
+        f"num_residual_streams={getattr(cfg, 'num_residual_streams', None)}"
+    )
+
+    try:
+        block_submods = _get_exp_attn_spec(cfg)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to derive V4 TransformerBlockSubmodules for pruned "
+            f"config (hidden_size={cfg.hidden_size}): {e}"
+        ) from e
+
+    # ── Step 3: construct mtp_block_spec ─────────────────────────────
+    try:
+        mtp_block_spec = _ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND(
+            cfg, block_submods, TESpecProvider()
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"get_gpt_mtp_block_spec_for_backend failed on pruned V4 spec: {e}"
+        ) from e
+
+    if mtp_block_spec is None:
+        print_rank_0(
+            "[MTP rebuild] WARNING: helper returned None — MTP cannot be "
+            "constructed on this rank. Falling back to no-MTP artifact."
+        )
+        return
+
+    # ── Step 4: instantiate MultiTokenPredictionBlock ────────────────
+    # The constructor accepts ModuleSpec(module=MultiTokenPredictionBlock,
+    # submodules=<helper output>). pg_collection defaults to
+    # ProcessGroupCollection.use_mpu_process_groups(['cp','tp']).
+    mtp_module = MultiTokenPredictionBlock(
+        config=cfg,
+        spec=ModuleSpec(module=MultiTokenPredictionBlock, submodules=mtp_block_spec),
+    ).to(device=torch.cuda.current_device(), dtype=torch.bfloat16)
+
+    # ── Step 5: attach to GPTModel (4 state fields) ─────────────────
+    unwrapped_model.mtp_block_spec = mtp_block_spec
+    unwrapped_model.mtp_process = True
+    if not hasattr(unwrapped_model, "embedding") or unwrapped_model.embedding is None:
+        raise RuntimeError(
+            "unwrapped_model.embedding is missing; MTP._get_embeddings needs it"
+        )
+    unwrapped_model.mtp = mtp_module
+    print_rank_0(
+        f"[MTP rebuild] attached MultiTokenPredictionBlock "
+        f"(n_params={sum(p.numel() for p in mtp_module.parameters())})"
+    )
+
+    # ── Step 6: load MTP weights via Bridge ──────────────────────────
+    # build_conversion_tasks walks unwrapped_model.named_parameters() and
+    # emits tasks for every Megatron name it can match to HF keys. The newly
+    # attached mtp module's parameters show up with names like "mtp.*", so a
+    # re-run of the full load naturally picks them up (decoder weights will
+    # be remapped too but their parameters are already loaded — copy_ is
+    # idempotent on already-matching values).
+    try:
+        bridge.load_weights_hf_to_megatron(
+            hf_pretrained=hf_model_name_or_path,
+            megatron_model=unwrapped_model,
+        )
+    except Exception as e:
+        print_rank_0(
+            f"[MTP rebuild] WARNING: Bridge weight reload raised {type(e).__name__}: {e}. "
+            f"Continuing; MTP weights may be partially uninitialized."
+        )
+        return
+
+    # Sanity check: any MTP parameter still at all-zeros after load?
+    n_uninit = 0
+    for name, p in unwrapped_model.mtp.named_parameters():
+        if torch.all(p == 0):
+            n_uninit += 1
+    if n_uninit > 0:
+        print_rank_0(
+            f"[MTP rebuild] WARNING: {n_uninit} MTP parameters are all-zeros "
+            f"after reload — likely missing HF mapping"
+        )
+    else:
+        print_rank_0("[MTP rebuild] all MTP parameters populated from HF checkpoint")
+
+
+def _apply_v4_post_prune_slicing(model, export_config, hidden_size_order=None, n_mtp_after=0):
     """Slice V4-specific weights not tracked by mcore_minitron's DynamicModule.
 
     After mcore_minitron pruning + export, standard weights are pruned but V4's
@@ -455,6 +623,8 @@ def _apply_v4_post_prune_slicing(model, export_config, hidden_size_order=None):
         hidden_size_order: Tensor of channel indices sorted by importance
             (from mcore_minitron's sort_parameters). When provided, the top
             target_hidden indices are used for slicing V4 weights.
+        n_mtp_after: Number of MTP layers retained on this rank. Non-zero only
+            on the last PP rank (where model.mtp is constructed).
     """
     target_hidden = export_config.get("hidden_size")
     if target_hidden is None:
@@ -463,6 +633,12 @@ def _apply_v4_post_prune_slicing(model, export_config, hidden_size_order=None):
     cfg = model.config
     hc_mult = getattr(cfg, "hc_mult", 4)
     target_hc_dim = hc_mult * target_hidden
+
+    print_rank_0(
+        f"V4 post-prune slicing entry: target_hidden={target_hidden}, "
+        f"hc_mult={hc_mult}, n_mtp_after={n_mtp_after}, "
+        f"has_model_mtp={hasattr(model, 'mtp') and model.mtp is not None}"
+    )
 
     # Build the index tensor for hidden_size dimension slicing
     if hidden_size_order is not None:
@@ -562,6 +738,20 @@ def main(args):
 
     export_config = build_export_config(args)
 
+    # Read the source HF config once; downstream code reuses `_hf_raw_*` values
+    # to decide MTP-layer retention, PP layout, etc.
+    with open(os.path.join(args.hf_model_name_or_path, "config.json")) as _f:
+        _hf_raw_config = json.load(_f)
+    _hf_src_n_mtp = _hf_raw_config.get("num_nextn_predict_layers", 0)
+    if args.num_mtp_layers is not None:
+        n_mtp_target = args.num_mtp_layers
+    else:
+        n_mtp_target = _hf_src_n_mtp
+    print_rank_0(
+        f"MTP retention: source num_nextn_predict_layers={_hf_src_n_mtp}, "
+        f"target n_mtp_after={n_mtp_target} (CLI override={args.num_mtp_layers})"
+    )
+
     provider_overrides = {
         "tensor_model_parallel_size": 1,
         "expert_tensor_parallel_size": 1,
@@ -575,7 +765,14 @@ def main(args):
     # Monkey-patch to return None (skip MTP) on ValueError instead of crashing.
     import megatron.core.models.gpt.gpt_layer_specs as _gpt_specs
 
-    _orig_mtp_spec = _gpt_specs.get_gpt_mtp_block_spec_for_backend
+    # Capture the original helper so _rebuild_mtp_after_prune can restore it.
+    # Guard against re-entry (e.g. if main() is called twice in the same
+    # process) — only overwrite if the module-level slot is still unset.
+    if _ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND is None:
+        _ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND = (
+            _gpt_specs.get_gpt_mtp_block_spec_for_backend
+        )
+    _orig_mtp_spec = _ORIG_GET_GPT_MTP_BLOCK_SPEC_FOR_BACKEND
 
     def _safe_mtp_spec(*a, **kw):
         try:
@@ -653,12 +850,9 @@ def main(args):
 
     # V4 uses hash MoE layers which require explicit pipeline layout when PP > 1.
     if args.pp_size > 1:
-        with open(os.path.join(args.hf_model_name_or_path, "config.json")) as f:
-            hf_raw = json.load(f)
-        n_layers = hf_raw["num_hidden_layers"]
-        n_mtp = hf_raw.get("num_nextn_predict_layers", 0)
+        n_layers = _hf_raw_config["num_hidden_layers"]
         provider_overrides["pipeline_model_parallel_layout"] = _build_pp_layout(
-            n_layers, args.pp_size, n_mtp=n_mtp
+            n_layers, args.pp_size, n_mtp=_hf_src_n_mtp
         )
 
     # Use Bridge API directly for model loading. The installed modelopt's
@@ -1039,13 +1233,7 @@ def main(args):
     # `decoder.layers` length. Without this, validation loss crashes inside
     # the pipeline schedule with `IndexError: list index out of range` when a
     # tail rank ends up with 0 layers.
-    n_mtp_after = 0
-    try:
-        with open(os.path.join(args.hf_model_name_or_path, "config.json")) as f:
-            _hf_raw_for_layout = json.load(f)
-        n_mtp_after = _hf_raw_for_layout.get("num_nextn_predict_layers", 0)
-    except Exception:
-        pass
+    n_mtp_after = n_mtp_target
     new_layout = _rebuild_pp_layout_after_prune(
         unwrapped_model,
         args.pp_size,
@@ -1060,6 +1248,24 @@ def main(args):
         f"(model.decoder.layers={len(unwrapped_model.decoder.layers)} on this rank)"
     )
 
+    # ── MTP block rebuild (Path C) ───────────────────────────────────
+    # Calibration skipped MTP via monkey-patches (mHC+MTP forward hang).
+    # Rebuild MTP now on the last PP rank using the pruned config, so the
+    # pruned artifact carries MTP weights for downstream CPT/SFT.
+    from megatron.core import parallel_state as _ps
+    try:
+        _pp_rank = _ps.get_pipeline_model_parallel_rank()
+    except Exception:
+        _pp_rank = 0  # single-process fallback
+    _rebuild_mtp_after_prune(
+        unwrapped_model=unwrapped_model,
+        bridge=bridge,
+        hf_model_name_or_path=args.hf_model_name_or_path,
+        pp_rank=_pp_rank,
+        pp_size=args.pp_size,
+        n_mtp=n_mtp_after,
+    )
+
     # ── V4-specific post-pruning weight slicing ──────────────────────
     # mcore_minitron's DynamicModule system correctly prunes standard
     # weights (embedding, layernorms, MLA projections, expert FFN, router)
@@ -1068,7 +1274,9 @@ def main(args):
     #   - Indexer (weights_proj, compressor.wkv/wgate): input dim = hidden_size
     #   - Hyper-Connection fn weights: last dim = hc_mult * hidden_size
     # These must be sliced in-place to match the pruned hidden_size.
-    _apply_v4_post_prune_slicing(unwrapped_model, export_config, hidden_size_order)
+    _apply_v4_post_prune_slicing(
+        unwrapped_model, export_config, hidden_size_order, n_mtp_after=n_mtp_after
+    )
 
     # ── Validation loss on the pruned model ─────────────────────────
     # Use a small held-out subset of the calibration data to estimate the
