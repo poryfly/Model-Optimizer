@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DeepSeek-V4 Pruned 预训练启动脚本 (Phase 2 训练)
+# DeepSeek-V4 Pruned 恢复训练脚本 (Resume Training)
 # ==============================================================================
 #
-# 训练前置条件: 已通过 convert_to_distcp.sh 完成 HF -> .distcp 转换
+# 从 run_pretrain.sh 保存的 checkpoint 恢复训练, 加载 optimizer + rng state,
+# 从上次保存的 iteration 继续训练.
 #
-# 训练自身从 .distcp 加载, 走 Megatron 原生 load 路径, 不走 HF wildcards,
-# 避开 Bridge 的 HF safetensors 加载路径上 tid2eid 缺失 bug.
+# 与 run_pretrain.sh 的关键区别:
+#   1. LOAD_FROM_CHECKPOINT 指向上一次训练保存的 checkpoints 目录
+#   2. NO_LOAD_OPTIM=false  — 加载 optimizer state (初始训练时跳过因为 distcp 无 optim)
+#   3. NO_LOAD_RNG=false    — 加载 rng state
+#   4. FINETUNE=false       — resume 模式 (非 finetune), 保留 iteration 计数
+#   5. OUTPUT_DIR 使用新目录, 避免覆盖之前的 checkpoint
+#   6. TRAIN_ITERS 是总目标迭代数 (不是剩余), Megatron 从 checkpoint 的 iteration 继续到该值
+#
+# 用法:
+#   1. 修改 PREV_OUTPUT_DIR 指向上一次训练的输出目录
+#   2. 修改 TRAIN_ITERS 为总目标迭代数 (已完成的 + 要继续的)
+#   3. bash resume_pretrain.sh
 # ==============================================================================
 
 set -euo pipefail
@@ -16,48 +27,58 @@ set -euo pipefail
 # ==============================================================================
 
 # ---- 路径 ----
-# MODEL 只作为 HF config 源 (load_weights=False, 不读 safetensors)
-# HF 原始权重必须已通过 convert_to_distcp.sh 转成 Megatron .distcp
 MODEL="/workdir/model_input/dpsk-v4-4B-A1.5B"
 DATASET_DIR="/workdir/data/alpaca_train_text_document"
-OUTPUT_DIR="/workdir/model_output/"
+
+# 上一次训练的输出目录 (从中加载 checkpoint)
+PREV_OUTPUT_DIR="/workdir/model_output/phase1"
+# 本次 resume 训练的输出目录 (保存新 checkpoint, 避免覆盖)
+OUTPUT_DIR="/workdir/model_output/phase2"
+
 BRIDGE_DIR="/workdir/Megatron-Bridge"
 PYTHON_SCRIPT="/workdir/pretrain_dpskv4_pruned.py"
-# ---- 恢复训练 (从 .distcp 加载, 走 Megatron 原生 load 路径, 不走 HF wildcards) ----
-# pretrain_dpskv4_pruned.py 自动检测: 指向 .distcp/iter_xxx/ 时走 Megatron load
-# 训练自身产出的 checkpoint 在 OUTPUT_DIR/checkpoints, 由 pretrain_dpskv4_pruned.py 管理
-LOAD_FROM_CHECKPOINT="/workdir/model_input/checkpoint-10000" #/workdir/model_input/dpsk-v4-4B-A1.5B
+
+# ---- Checkpoint 加载 (从上一次训练保存的 checkpoint 恢复) ----
+# 指向 PREV_OUTPUT_DIR/checkpoints, Megatron 会自动读取 latest_checkpointed_iteration.txt
+# 找到最新的 iter_xxxx 并加载 (含 optimizer + rng state)
+LOAD_FROM_CHECKPOINT="${PREV_OUTPUT_DIR}/checkpoints"
 
 # ---- 数据模式 ----
 USE_MOCK_DATA=false
 
-# ---- 并行度 (跟 convert_to_distcp.sh 一致: TP=1 PP=4 EP=2) ----
-# 改用 PP=4 EP=2 是为了跟之前能跑通的 iter_0000002 一致, 避免 PP=1 + EP=8 触发的
-# MoE alltoall split size mismatch 问题.
+# ---- 并行度 (必须与初始训练一致, 否则无法加载 checkpoint) ----
 TENSOR_MODEL_PARALLEL_SIZE=1
-PIPELINE_MODEL_PARALLEL_SIZE=1
-PIPELINE_MODEL_PARALLEL_LAYOUT=""  #Et*4|t*4|t*4|t*4L
-EXPERT_MODEL_PARALLEL_SIZE=8
+PIPELINE_MODEL_PARALLEL_SIZE=4
+PIPELINE_MODEL_PARALLEL_LAYOUT="Et*4|t*4|t*4|t*4L"
+EXPERT_MODEL_PARALLEL_SIZE=2
 CONTEXT_PARALLEL_SIZE=1
 NUM_NODES=1
 
-# ---- 序列长度 ----
+# ---- 序列长度 (必须与初始训练一致) ----
 MAX_LENGTH=1024
 
 # ---- Batch size / 训练 ----
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=32
-TRAIN_ITERS=2
-FINETUNE=true
+# 总目标迭代数 (已完成的 + 要继续的)
+# 例: 上次训练到 iter 2, 想再训练 998 步 → TRAIN_ITERS=1000
+TRAIN_ITERS=1000
+FINETUNE=false
 PADDING_FREE=false
 
 # ---- Checkpoint 加载控制 ----
-# 初始训练: distcp 只有模型权重, 无 optim/rng, 加载时跳过
-# --no_load_optim / --no_load_rng 是 Megatron 标准 CLI 参数
-NO_LOAD_OPTIM=true
-NO_LOAD_RNG=true
+# Resume 模式: 加载 optimizer + rng (与初始训练相反)
+NO_LOAD_OPTIM=false
+NO_LOAD_RNG=false
 
-# ---- 学习率 / 优化器 ----
+# ---- Checkpoint 保存 ----
+SAVE_STEPS=100
+SAVE_TOTAL_LIMIT=10
+NO_SAVE_OPTIM=false
+NO_SAVE_RNG=false
+ASYNC_SAVE=false
+
+# ---- 学习率 / 优化器 (与初始训练一致) ----
 LR=1.8e-4
 MIN_LR=1.8e-5
 LR_WARMUP_FRACTION=0.04
@@ -86,15 +107,6 @@ APPLY_DSA_KERNEL_FUSION=false
 CROSS_ENTROPY_LOSS_FUSION=true
 MTP_NUM_LAYERS=0
 
-# ---- Checkpoint 保存 ----
-SAVE_STEPS=5
-SAVE_TOTAL_LIMIT=2
-NO_SAVE_OPTIM=false
-NO_SAVE_RNG=false
-ASYNC_SAVE=false
-
-
-
 # ---- 验证 / 日志 ----
 EVAL_INTERVAL=0    # 0 = 禁用 eval
 EVAL_ITERS=0
@@ -112,7 +124,7 @@ mkdir -p "${OUTPUT_DIR}"
 # 启动训练
 # ==============================================================================
 
-LOG_FILE="${OUTPUT_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${OUTPUT_DIR}/resume_$(date +%Y%m%d_%H%M%S).log"
 PID_FILE="${OUTPUT_DIR}/train.pid"
 
 # 构建 CLI 参数
@@ -174,17 +186,18 @@ fi
 
 # 打印配置
 echo "======================================"
-echo "DeepSeek-V4 Pruned Pretraining (Phase 2 训练)"
+echo "DeepSeek-V4 Pruned Resume Training"
 echo "======================================"
-echo "  distcp:           ${LOAD_FROM_CHECKPOINT}"
+echo "  Load checkpoint:  ${LOAD_FROM_CHECKPOINT}"
 echo "  Model (config):   ${MODEL}"
 echo "  Output:           ${OUTPUT_DIR}"
 echo "  Log:              ${LOG_FILE}"
 echo "  Parallelism:      TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} EP=${EXPERT_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE}"
 echo "  Batch:            micro=${MICRO_BATCH_SIZE} global=${GLOBAL_BATCH_SIZE}"
+echo "  Train iters:      ${TRAIN_ITERS} (total, resumed from checkpoint)"
 echo "  Finetune:         ${FINETUNE}"
-echo "  no_load_optim:    ${NO_LOAD_OPTIM}"
-echo "  no_load_rng:      ${NO_LOAD_RNG}"
+echo "  load_optim:       $([ "${NO_LOAD_OPTIM}" = "false" ] && echo "true" || echo "false")"
+echo "  load_rng:         $([ "${NO_LOAD_RNG}" = "false" ] && echo "true" || echo "false")"
 echo "  LR:               ${LR} -> ${MIN_LR}"
 echo "======================================"
 

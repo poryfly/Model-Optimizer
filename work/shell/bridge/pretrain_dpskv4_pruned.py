@@ -38,10 +38,12 @@
 """
 
 import argparse
+import json
 import os
 import sys
-import torch
 from typing import Optional
+
+import torch
 
 # Megatron Bridge imports
 from megatron.bridge import AutoBridge
@@ -162,6 +164,14 @@ def parse_args():
     ckpt.add_argument("--save_total_limit", type=int, default=10)
     ckpt.add_argument("--no_save_optim", action="store_true", default=False)
     ckpt.add_argument("--no_save_rng", action="store_true", default=False)
+    # -- Megatron 3rdparty 标准 CLI: 加载时跳过 optimizer / rng state
+    # 场景: 初始训练加载只有模型权重的 .distcp (来自 HF 转换, 无 optim state)
+    # Bridge 内部 CheckpointConfig 字段名是 load_optim / load_rng (bool, 默认 True),
+    # 取反后传入即可.
+    ckpt.add_argument("--no_load_optim", action="store_true", default=False,
+                      help="加载 checkpoint 时跳过 optimizer state (Megatron 标准 CLI)")
+    ckpt.add_argument("--no_load_rng", action="store_true", default=False,
+                      help="加载 checkpoint 时跳过 rng state (Megatron 标准 CLI)")
     ckpt.add_argument("--load_from_checkpoint", type=str, default=None,
                      help="从指定 checkpoint 恢复训练")
     ckpt.add_argument("--async_save", action="store_true", default=False)
@@ -212,6 +222,17 @@ def build_config(args) -> ConfigContainer:
     model_cfg.num_layers_in_last_pipeline_stage = None
     set_deepseek_v4_pipeline_model_parallel_layout(model_cfg)
 
+    # 如果用户显式传了 --pipeline_model_parallel_layout, 覆盖自动生成的 layout
+    # (跟 convert_to_distcp.sh 产出的 distcp 保持一致, 避免 layout 不匹配)
+    if args.pipeline_model_parallel_layout:
+        from megatron.core.transformer.pipeline_parallel_layer_layout import (
+            PipelineParallelLayerLayout,
+        )
+        model_cfg.pipeline_model_parallel_layout = PipelineParallelLayerLayout.from_str(
+            args.pipeline_model_parallel_layout,
+            model_cfg.pipeline_model_parallel_size,
+        )
+
     # MTP
     ratios = getattr(model_cfg, "csa_compress_ratios", None)
     num_layers = getattr(model_cfg, "num_layers", None)
@@ -230,6 +251,7 @@ def build_config(args) -> ConfigContainer:
     # MoE
     model_cfg.moe_token_dispatcher_type = args.moe_token_dispatcher_type
     model_cfg.moe_aux_loss_coeff = args.moe_aux_loss_coeff
+    model_cfg.moe_z_loss_coeff = args.moe_z_loss_coeff
     model_cfg.moe_router_force_load_balancing = False
     model_cfg.cross_entropy_loss_fusion = args.cross_entropy_loss_fusion
     model_cfg.cross_entropy_fusion_impl = "te"
@@ -322,15 +344,44 @@ def build_config(args) -> ConfigContainer:
     # ---- Checkpoint ----
     ckpt_dir = os.path.join(args.output_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
+
+    # 判断 load_from_checkpoint 是 HF 格式还是 Megatron 格式
+    # HF 格式（safetensors）→ pretrained_checkpoint
+    # Megatron 格式（.distcp / iter_xxx）→ load
+    pretrained_ckpt = None
+    load_ckpt = ckpt_dir  # 默认从输出目录恢复训练
+    if args.load_from_checkpoint:
+        from megatron.bridge.training.utils.checkpoint_utils import is_hf_checkpoint_dir, checkpoint_exists
+        if is_hf_checkpoint_dir(args.load_from_checkpoint):
+            pretrained_ckpt = args.load_from_checkpoint
+            print(f"[INFO] Detected HF-format checkpoint, using pretrained_checkpoint: {pretrained_ckpt}")
+        elif checkpoint_exists(args.load_from_checkpoint):
+            load_ckpt = args.load_from_checkpoint
+            print(f"[INFO] Detected Megatron-format checkpoint, using load: {load_ckpt}")
+        else:
+            pretrained_ckpt = args.load_from_checkpoint
+            print(f"[INFO] Unknown checkpoint format, trying as pretrained_checkpoint: {pretrained_ckpt}")
+
     ckpt_cfg = CheckpointConfig(
         save_interval=args.save_steps,
         save=ckpt_dir,
-        load=args.load_from_checkpoint or ckpt_dir,
+        load=load_ckpt,
+        pretrained_checkpoint=pretrained_ckpt,
         ckpt_format="torch_dist",
         fully_parallel_save=True,
         async_save=args.async_save,
         save_optim=not args.no_save_optim,
         save_rng=not args.no_save_rng,
+        most_recent_k=args.save_total_limit,
+        # --no_load_optim / --no_load_rng 是 Megatron 标准 CLI, 翻译成
+        # Bridge 的 load_optim=False / load_rng=False (Bridge 默认 True 表示要加载).
+        load_optim=not args.no_load_optim,
+        load_rng=not args.no_load_rng,
+        # finetune 语义: 跳过 optimizer/rng 加载, 从头开始训练
+        # 触发场景: (a) 走 HF pretrained_checkpoint 路径, (b) 用户传 --finetune
+        # 修复: 之前用 `pretrained_ckpt is not None`, distcp 路径永远为 False
+        #       导致 .distcp (无 optim state) 加载时 KeyError 'optimizer'
+        finetune=(pretrained_ckpt is not None or args.finetune),
     )
 
     # ---- RNG / Distributed / DDP ----
@@ -398,7 +449,11 @@ def main():
     from megatron.bridge.training.gpt_step import forward_step as gpt_forward_step
 
     forward_step = gpt_forward_step
-    pretrain(config=cfg, forward_step_func=forward_step)
+
+    pretrain(
+        config=cfg,
+        forward_step_func=forward_step,
+    )
 
 
 if __name__ == "__main__":
