@@ -19,9 +19,11 @@ This module provides a simplified API for pruning that is based on the NAS infra
 simplifies the overall workflow to accommodate for the simpler nature of pruning algorithms.
 """
 
+# nas is a required - so let's check if it's available
+import modelopt.torch.nas
 from modelopt.torch.utils import import_plugin
 
-from . import fastnas, plugins
+from . import fastnas, gradnas, plugins
 from .pruning import *
 
 with import_plugin("mcore_minitron", verbose=False):

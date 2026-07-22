@@ -13,17 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Handles nas plugins for third-party modules."""
+"""Plugins for pruning for Transformers Attention."""
 
-from modelopt.torch.utils import import_plugin
+# import nas plugin to check if it is enabled else raises an Exception
+from modelopt.torch.nas.plugins.transformers import *  # noqa: F403
 
-from .torch import *
+from ..fastnas import FastNASConfig
+from ..gradnas import GradNASConfig
 
-with import_plugin("megatron"):
-    from .megatron import *
 
-with import_plugin("transformer engine"):
-    from .transformer_engine import *
+def _n_heads_config():
+    return {"n_heads_ratio": None, "n_heads_divisor": 1}
 
-with import_plugin("transformers"):
-    from .transformers import *
+
+FastNASConfig.register_default(
+    {
+        "hf.BertAttention": _n_heads_config(),
+        "hf.GPTJAttention": _n_heads_config(),
+    }
+)
+
+GradNASConfig.register_default(
+    {
+        "hf.BertAttention": _n_heads_config(),
+        "hf.GPTJAttention": _n_heads_config(),
+    }
+)

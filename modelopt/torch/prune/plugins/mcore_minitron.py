@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Module implementing top-level ``mcore_minitron`` pruning handler for NVIDIA Megatron-Core models.
+"""Module implementing top-level ``mcore_minitron`` pruning handler for NVIDIA Megatron-Core / NeMo models.
 
 Minitron pruning algorithm uses activation magnitudes to estimate importance of neurons / attention heads / mamba heads
 in the model.
@@ -24,19 +24,15 @@ Supports both GPT (attention-based) and Mamba (state-space) models, as well as h
 Actual dynamic module implementations are at :mod:`modelopt.torch.nas.plugins.megatron`.
 """
 
-import io
-import sys
+import copy
 from collections.abc import Callable
-from dataclasses import dataclass
 from functools import partial
-from itertools import product
 from typing import Any
 from warnings import warn
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_rank,
@@ -47,34 +43,27 @@ from megatron.core.tensor_parallel import (
     reduce_from_tensor_model_parallel_region,
 )
 from pydantic import create_model
-from rich.console import Console
-from rich.markup import escape as rich_escape
-from rich.panel import Panel
-from rich.table import Table
-from tqdm import tqdm
 
 from modelopt.torch.nas.conversion import NASModeRegistry
 from modelopt.torch.nas.plugins.megatron import (
-    HAS_HYBRID,
     HAS_MAMBA,
+    HAS_V4,
     SUPPORTED_MODELS,
     _DynamicMambaLayer,
     _DynamicMambaMixer,
     _DynamicMCoreLanguageModel,
     _DynamicMLP,
-    _DynamicMoELayer,
     _DynamicSelfAttention,
     _DynamicSequentialMLP,
     _DynamicTransformerLayer,
 )
-from modelopt.torch.nas.plugins.megatron_model_stats import (
-    mcore_memory_footprint_mb,
-    mcore_param_count,
-    parse_main_layer_chars,
-    print_mcore_model_stats,
-)
+if HAS_V4:
+    from modelopt.torch.nas.plugins.megatron import (
+        _DynamicHyperConnectionTransformerLayer,
+        _DynamicV4SelfAttention,
+    )
 from modelopt.torch.nas.registry import DMRegistry
-from modelopt.torch.nas.utils import get_subnet_config, sample, sort_parameters
+from modelopt.torch.nas.utils import get_subnet_config, sort_parameters
 from modelopt.torch.opt.config import ModeloptBaseConfig, get_kwargs_for_create_model_with_rules
 from modelopt.torch.opt.conversion import ApplyModeError
 from modelopt.torch.opt.dynamic import DynamicModule, DynamicSpace
@@ -87,7 +76,7 @@ from modelopt.torch.opt.mode import (
 from modelopt.torch.opt.searcher import BaseSearcher, SearchConfig, SearchStateDict
 from modelopt.torch.opt.utils import named_hparams
 from modelopt.torch.utils import distributed as dist
-from modelopt.torch.utils import get_module_device, num2hrb, print_rank_0
+from modelopt.torch.utils import get_module_device, print_rank_0
 
 from ..pruning import PruneModeRegistry
 
@@ -105,6 +94,9 @@ SUPPORTED_HPARAMS = {
     "moe_ffn_hidden_size",
     "moe_shared_expert_intermediate_size",
     "num_moe_experts",
+    # TE linear (shared from hidden_size)
+    "input_size",
+    "output_size",
     # 2. Depth pruning
     "num_layers",
 }
@@ -137,7 +129,7 @@ def drop_mcore_language_model_layers(model: nn.Module, *, layers_to_drop: list[i
     assert isinstance(model, supported_model_types), (
         f"Model should have one of {supported_model_types} submodule, got {model}"
     )
-    print_rank_0(f"Dropping decoder layers {layers_to_drop} from model.")
+    print_rank_0(f"Dropping layers {layers_to_drop} from {n} ({type(model)}).")
 
     # get the number of layers remaining in each pp rank
     layers_remaining_per_pp = torch.zeros(
@@ -161,81 +153,34 @@ def drop_mcore_language_model_layers(model: nn.Module, *, layers_to_drop: list[i
     new_num_layers = sum(layers_remaining_per_pp)
 
     # reindex kept layers, exclude sharded state dict for dropped layers
-    layer_number = sum(layers_remaining_per_pp[: get_pipeline_model_parallel_rank()]) + 1
-    kept_layers = []
+    layer_offset = sum(layers_remaining_per_pp[: get_pipeline_model_parallel_rank()])
+    layer_number = layer_offset + 1
+    dropped_layers = []
     for layer in model.decoder.layers:
-        if layer.layer_number not in layers_to_drop:
+        if layer.layer_number in layers_to_drop:
+            layer.layer_number = -1  # should not be used
+            # layer.sharded_state_dict = lambda prefix, sharded_offsets, metadata: {}
+            dropped_layers.append(layer)
+        else:
             layer.layer_number = layer_number
+            layer.get_transformer_layer_offset = lambda: layer_offset
             layer_number += 1
-            kept_layers.append(layer)
-    model.decoder.layers = nn.ModuleList(kept_layers)
+
+    # remove dropped layers from the modulelist
+    model.decoder.layers = nn.ModuleList(
+        [layer for layer in model.decoder.layers if layer.layer_number != -1]
+    )
+    for layer in dropped_layers:
+        del layer
 
     model.config.num_layers = new_num_layers
 
 
-def _get_hybrid_pattern_key(model: nn.Module) -> str | None:
-    """Return the attribute name carrying the hybrid block pattern for hybrid models, else None.
-
-    Handles both ``MambaModel`` (which still uses ``hybrid_override_pattern``) and plain
-    ``HybridModel`` (the parent class introduced in modern Megatron-LM, which carries
-    ``hybrid_layer_pattern``). Detecting by attribute presence avoids fragile isinstance
-    checks against a class hierarchy that may shift across MCore versions.
-    """
-    for attr in ("hybrid_override_pattern", "hybrid_layer_pattern"):
-        if getattr(model, attr, None):
-            return attr
-    return None
-
-
-def _rprint(*renderables: Any) -> None:
-    """Render rich renderables and print on rank 0 only."""
-    buf = io.StringIO()
-    Console(file=buf, highlight=False, force_terminal=sys.stdout.isatty(), width=160).print(
-        *renderables
-    )
-    print_rank_0()
-    print_rank_0(buf.getvalue())
-
-
-# Constraint keys that trigger the grid-search path in MCoreMinitronSearcher.
-# Order defines priority: first active key is used as the primary display/sort metric.
-_METRIC_CONSTRAINT_PRIORITY = ("active_params", "params", "memory_mb")
-_METRIC_CONSTRAINTS = frozenset(_METRIC_CONSTRAINT_PRIORITY)
-
-
-@dataclass
-class CandidateSubnet:
-    ss_config: dict
-    metrics: dict[str, float]
-    score: float | None
-
-
-torch.serialization.add_safe_globals([CandidateSubnet])
-
-
 class MCoreMinitronSearcher(BaseSearcher):
-    """Searcher for Minitron pruning algorithm.
+    """Searcher for Minitron pruning algorithm."""
 
-    Supported constraint keys: ``export_config``, ``params``, ``active_params``, ``memory_mb``.
-
-    Available additional config options (used when a metric constraint is provided):
-    - `max_width_pruning`: Maximum fraction per width hyperparameter to prune (default: 0.40).
-        Only top (1 - max_width_pruning) choices will be considered.
-    - `max_depth_pruning`: Maximum fraction per depth hyperparameter to prune (default: 0.20).
-        Only top (1 - max_depth_pruning) choices will be considered.
-    - `hparams_to_skip`: List of hparams to skip during the search (default: None).
-    - `top_k`: Number of candidates to consider for score_func validation (default: 10).
-    - `seq_length`: Sequence length for KV-cache memory estimate (default: 4096).
-        Only used with the ``memory_mb`` constraint.
-    - `batch_size`: Batch size for KV-cache and Mamba-state memory estimate (default: 1).
-        Only used with the ``memory_mb`` constraint.
-    """
-
-    local_activations: dict[str, torch.Tensor]
+    activations_per_rank: list[dict[str, torch.Tensor]]
     layer_scores: dict[int, torch.Tensor]
-    sorted_layers: list[int] | None  # 1-indexed sorted list of layer numbers
-    # Dict from params constraint to list of all CandidateSubnets fitting that constraint
-    all_candidates_per_constraint: dict[tuple, list[CandidateSubnet]]
 
     @property
     def default_search_config(self) -> SearchConfig:
@@ -245,31 +190,17 @@ class MCoreMinitronSearcher(BaseSearcher):
             "max_iter_data_loader": 1024,
             "skip_sorting": False,
             "scores_path": None,
-            # Additional search config for metric-based pruning
-            "max_width_pruning": 0.40,
-            "max_depth_pruning": 0.20,
-            "hparams_to_skip": None,
-            "top_k": 10,
-            # Memory footprint config (only used with memory_mb constraint)
-            "seq_length": 4096,
-            "batch_size": 1,
         }
 
     @property
     def default_state_dict(self) -> SearchStateDict:
         """Return default state dict for importance scores and activations from forward loop."""
-        return {
-            "local_activations": {},
-            "layer_scores": {},
-            "sorted_layers": None,
-            "all_candidates_per_constraint": {},
-        }
+        return {"activations_per_rank": [], "layer_scores": {}}
 
     def sanitize_search_config(self, config: SearchConfig | None) -> SearchConfig:
         """Sanitize the search config dict."""
         config = super().sanitize_search_config(config)
-        if config["scores_path"]:
-            config["checkpoint"] = config["scores_path"]
+        config["checkpoint"] = config["scores_path"]
         config["verbose"] = True  # Print for all ranks
         return config
 
@@ -277,68 +208,54 @@ class MCoreMinitronSearcher(BaseSearcher):
         """Optional pre-processing steps before the search."""
         super().before_search()
 
-        # Check that the constraint is valid.
-        # export_config must be the sole key; metric constraints can be combined freely.
-        active_metric_keys = self.constraints.keys() & _METRIC_CONSTRAINTS
-        assert self.constraints.keys() <= {"export_config"} | _METRIC_CONSTRAINTS, (
-            f"Only {sorted({'export_config'} | _METRIC_CONSTRAINTS)} constraints are supported!"
+        # Check that the constraint is valid
+        assert self.constraints.keys() == {"export_config"}, (
+            "Only `export_config` constraint is supported for pruning!"
         )
-        assert not ("export_config" in self.constraints and active_metric_keys), (
-            "export_config cannot be combined with metric constraints!"
+
+        self.constraints["export_config"] = copy.deepcopy(self.constraints["export_config"])
+        export_config = self.constraints["export_config"]
+        if "num_query_groups" in export_config:
+            warn("num_query_groups is no longer supported (since 0.41)! It will be ignored.")
+            if export_config["num_query_groups"] != self.model.config.num_query_groups:  # type: ignore[index]
+                raise ValueError(f"num_query_groups must be {self.model.config.num_query_groups}!")
+            export_config.pop("num_query_groups")  # type: ignore[union-attr]
+        assert isinstance(export_config, dict)  # to keep mypy happy
+        assert export_config.keys() <= SUPPORTED_HPARAMS, (
+            f"Only {SUPPORTED_HPARAMS} are supported for pruning! Received: {export_config.keys()}"
         )
-        assert self.constraints, "At least one constraint must be provided!"
 
-        if "export_config" in self.constraints:
-            export_config = self.constraints["export_config"]
-            assert isinstance(export_config, dict)  # to keep mypy happy
-            if "num_query_groups" in export_config:
-                warn("num_query_groups is no longer supported (since 0.41)! It will be ignored.")
-                if export_config["num_query_groups"] != self.model.config.num_query_groups:
-                    raise ValueError(
-                        f"num_query_groups must be {self.model.config.num_query_groups}!"
-                    )
-                export_config.pop("num_query_groups")
-            assert export_config.keys() <= SUPPORTED_HPARAMS, (
-                f"Only {SUPPORTED_HPARAMS} are supported for pruning! Received: {export_config=}"
-            )
-
-            # Only sort the parameters that are to be pruned
-            # If a user only prunes depth, we should not sort width parameters
-            self.hps_to_sort = set(export_config.keys())
-        else:
-            for k in active_metric_keys:
-                assert isinstance(self.constraints[k], (int, float)), f"{k} must be a float!"
-            assert self.has_score, "score_func (e.g. MMLU) is required for metric-based pruning!"
-            export_config = None
-            # Sort all parameters for metric-based pruning
-            self.hps_to_sort = SUPPORTED_HPARAMS
+        # Only sort the parameters that are to be pruned
+        # If a user only prunes depth, we should not sort width parameters
+        self.hps_to_sort = SUPPORTED_HPARAMS & export_config.keys()
 
         for n, hp in named_hparams(self.model, unique=True):
             hp_name = n.split(".")[-1]
             if hp.is_configurable:
                 # Make sure configurable hparams are the ones with right names else implementation needs to be fixed!
                 assert hp_name in SUPPORTED_HPARAMS, f"[ImplError] Invalid hparam {hp_name}!"
-                if export_config is not None and hp_name in export_config:
+                if hp_name in export_config:
                     assert export_config[hp_name] in hp.choices, (
                         f"Invalid choice {export_config[hp_name]} for {n}! Available choices: {hp.choices}"
                     )
             hp.reset_choices()  # Make sure ConcatHparam choices are updated after modify()
 
-        assert isinstance(self.model, _DynamicMCoreLanguageModel), (
-            "Input should be unwrapped MCore model!"
-        )
-
     def run_search(self) -> None:
-        """Run forward loop to collect activations, sort parameters, and prune the model."""
-        print_mcore_model_stats(
-            self.model, "Original Model", self.config["seq_length"], self.config["batch_size"]
-        )
-        registry = ImportanceEstimatorRegistry(self.model)
-        if self.local_activations and self.layer_scores:  # Available from per-rank checkpoint
-            registry.set_local_activations_and_layer_scores(
-                self.local_activations, self.layer_scores
-            )
+        """Run actual search."""
+        # Run forward loop to collect activations and sort parameters
+        unwrapped_model = self.model
+        for m in self.model.modules():
+            if isinstance(m, _DynamicMCoreLanguageModel):
+                unwrapped_model = m
+                break
+        assert isinstance(unwrapped_model, _DynamicMCoreLanguageModel), "Model not supported!"
+
+        registry = ImportanceEstimatorRegistry(unwrapped_model)
+        if self.layer_scores and self.activations_per_rank:  # Available from checkpoint
+            print_rank_0("Loading activations and scores per rank from checkpoint...")
+            registry.set_activations_and_layer_scores(self.activations_per_rank, self.layer_scores)
         elif not self.config["skip_sorting"]:
+            print_rank_0("Running forward loop...")
             assert self.forward_loop is not None
             is_training = self.model.training
             self.model.eval()
@@ -347,402 +264,51 @@ class MCoreMinitronSearcher(BaseSearcher):
             self.model.train(is_training)
 
             # Store activations and layer scores for re-pruning with different export configs
-            self.local_activations, self.layer_scores = (
-                registry.get_local_activations_and_layer_scores()
+            self.activations_per_rank, self.layer_scores = (
+                registry.get_activations_and_layer_scores()
             )
             self.save_search_checkpoint(verbose=True)
 
         if self.config["skip_sorting"]:
             print_rank_0("Skipping sorting parameters...")
         else:
-            sort_parameters(self.model, self.hps_to_sort, verbose=False)
-        registry.cleanup()
-
-        if self.layer_scores:
-            # sort layers by scores and drop the lowest ones
-            self.sorted_layers = [
-                layer
-                for layer, _ in sorted(self.layer_scores.items(), key=lambda x: x[1], reverse=True)
-            ]
-            assert sorted(self.sorted_layers) == list(range(1, self.model.config.num_layers + 1))
-        else:
-            assert (
-                self.constraints.keys() == {"export_config"}
-                and "num_layers" not in self.constraints["export_config"]
-            ), "Cannot prune `num_layers` without collecting layer scores!"
-            self.sorted_layers = None
-
-        if self.constraints.keys() & _METRIC_CONSTRAINTS:
-            export_config = self.search_best_arch_by_metrics()
-        else:
-            export_config = self.constraints["export_config"]
+            sort_parameters(self.model, self.hps_to_sort, verbose=True)
 
         # Prune homogeneously
-        self._prune(export_config, prune_depth=True)
-
-        # Update the hybrid block-type pattern if pruning a hybrid model.
-        hybrid_key = _get_hybrid_pattern_key(self.model)
-        if hybrid_key is not None:
-            print_rank_0(f"Original {hybrid_key}: {getattr(self.model, hybrid_key)}")
-            new_num_layers = self.model.config.num_layers
-            assert self.sorted_layers is not None
-            kept_layers_numbers = self.sorted_layers[:new_num_layers]
-            setattr(
-                self.model,
-                hybrid_key,
-                "".join(
-                    c
-                    for i, c in enumerate(getattr(self.model, hybrid_key))
-                    if i + 1 in kept_layers_numbers
-                ),
-            )
-            print_rank_0(f"Pruned {hybrid_key}: {getattr(self.model, hybrid_key)}")
-
-        print_mcore_model_stats(
-            self.model, "Pruned Model", self.config["seq_length"], self.config["batch_size"]
-        )
-
-    def _prune(self, export_config: dict, prune_depth: bool = True) -> None:
-        """Prune the model homogeneously based on the export_config by setting active choices for configurable hparams.
-
-        Args:
-            export_config: Dictionary mapping hyperparameter names to their pruned values.
-            prune_depth: Whether to drop layers based on sorted_layers (default: True).
-        """
-        # Prune homogeneously
+        export_config = self.constraints["export_config"]
+        assert isinstance(export_config, dict)  # to keep mypy happy
         for n, hp in named_hparams(self.model, configurable=True):
             hp_name = n.split(".")[-1]
             if hp_name in export_config:
                 hp.active = export_config[hp_name]
 
         # Drop layers if depth pruning is enabled
-        if prune_depth:
-            num_layers_hp = self.model.get_hparam("num_layers")
-            if num_layers_hp.active != num_layers_hp.max:
-                assert self.sorted_layers is not None
-                layers_to_drop = self.sorted_layers[num_layers_hp.active :]
-                drop_mcore_language_model_layers(self.model, layers_to_drop=layers_to_drop)
+        num_layers_hp = unwrapped_model.get_hparam("num_layers")
+        if num_layers_hp.active != num_layers_hp.max:
+            if self.layer_scores:
+                # sort layers by importance scores and drop the lowest ones
+                sorted_layers = sorted(self.layer_scores.items(), key=lambda x: x[1], reverse=True)
+                layers_to_drop = [layer for layer, _ in sorted_layers[num_layers_hp.active :]]
+            else:
+                # No scores available (skip_sorting=True): drop the last N layers
+                all_layers = list(range(1, num_layers_hp.max + 1))
+                layers_to_drop = all_layers[num_layers_hp.active:]
+            drop_mcore_language_model_layers(self.model, layers_to_drop=layers_to_drop)
 
-        # Update model config with pruned architecture
-        # kv_channels can be None so we need to save from original hidden_size and num_attention_heads
-        if self.model.config.kv_channels is None:
-            self.model.config.kv_channels = (
-                self.model.config.hidden_size // self.model.config.num_attention_heads
+        # kv_channels can be None so we need to save original from original hidden_size and num_attention_heads
+        model_cfg = self.model.config
+        orig_kv_channels = getattr(model_cfg, "kv_channels")
+        if orig_kv_channels is None:
+            orig_kv_channels = getattr(model_cfg, "hidden_size") // getattr(
+                model_cfg, "num_attention_heads"
             )
-        # num_query_groups can be None so we need to save from original num_attention_heads
-        if self.model.config.num_query_groups is None:
-            self.model.config.num_query_groups = self.model.config.num_attention_heads
-        # moe_ffn_hidden_size can be None so we need to save from original ffn_hidden_size
-        if (
-            self.model.config.moe_ffn_hidden_size is None
-            and self.model.config.num_moe_experts is not None
-        ):
-            self.model.config.moe_ffn_hidden_size = self.model.config.ffn_hidden_size
-        # Now set hparam active choices
-        for hp_name, hp_value in export_config.items():
-            setattr(self.model.config, hp_name, hp_value)
+        setattr(model_cfg, "kv_channels", orig_kv_channels)
+        for n in SUPPORTED_HPARAMS:
+            if n in export_config:
+                setattr(model_cfg, n, export_config[n])
 
-        # Reinitialize the MoE token dispatcher after pruning
-        for m in self.model.modules():
-            if isinstance(m, _DynamicMoELayer):
-                m._export_reinit_token_dispatcher()
+        registry.cleanup()
 
-    def search_best_arch_by_metrics(self) -> dict:
-        """Search for the best architecture based on the given metric constraint.
-
-        Supports ``params``, ``active_params``, and ``memory_mb`` constraints.
-        Performs a grid-search over the search space to find subnets fitting the constraint,
-        then validates the top-k candidates using ``score_func`` (e.g. MMLU).
-
-        Returns:
-            export_config: Dictionary mapping hyperparameter names to their pruned values.
-        """
-        assert self.sorted_layers is not None
-        # Ordered list of active metric keys; primary (first) is used for sorting/display.
-        active_metric_keys = [k for k in _METRIC_CONSTRAINT_PRIORITY if k in self.constraints]
-        primary_key = active_metric_keys[0]
-        max_metrics: dict[str, float] = {k: float(self.constraints[k]) for k in active_metric_keys}  # type: ignore[arg-type]
-        max_width_pruning = self.config["max_width_pruning"]
-        max_depth_pruning = self.config["max_depth_pruning"]
-        hparams_to_skip = self.config["hparams_to_skip"]
-        top_k = self.config["top_k"]
-        constraints_str = ", ".join(f"{self._fmt_metric(v, k)} {k}" for k, v in max_metrics.items())
-        print_rank_0(f"\nSearching for the best pruned architecture under {constraints_str}...")
-
-        # 1. Find available search space choices (across all PP ranks)
-        hp_choices = {}
-        for n, hp in named_hparams(self.model, configurable=True):
-            hp_name = n.split(".")[-1]
-            hp_choices[hp_name] = hp.choices
-        pp_group = dist.DistributedProcessGroup(get_pipeline_model_parallel_group())
-        hp_choices = dist.DistributedProcessGroup.get_dist_syncd_obj(
-            hp_choices,
-            pp_group,
-            op=lambda all_pp_search_spaces: {
-                k: v for d in all_pp_search_spaces for k, v in d.items()
-            },
-        )
-
-        # 2. Perform grid-search over the search space to find subnets fitting all constraints
-        constraints_cache_key = tuple((k, max_metrics[k]) for k in active_metric_keys)
-        if constraints_cache_key not in self.all_candidates_per_constraint:
-            max_num_layers = self.model.get_hparam("num_layers").max
-            search_space_configs = MCoreMinitronSearcher._generate_search_space_combos(
-                hp_choices,
-                max_width_pruning,
-                max_depth_pruning,
-                hparams_to_skip,
-            )
-            selected = []
-            for ss_config in tqdm(
-                search_space_configs,
-                desc="Finding all candidates fitting the constraints...",
-                disable=not dist.is_master(),
-            ):
-                candidate_metrics = self._compute_candidate_metrics(ss_config, max_num_layers)
-                if all(candidate_metrics[k] <= max_metrics[k] for k in active_metric_keys):
-                    selected.append(
-                        CandidateSubnet(
-                            ss_config, {k: candidate_metrics[k] for k in active_metric_keys}, None
-                        )
-                    )
-            assert len(selected) > 0, "No subnets found fitting the constraints!"
-            print_rank_0(f"Found {len(selected)} candidates fitting the constraints!")
-            self.all_candidates_per_constraint[constraints_cache_key] = sorted(
-                selected, key=lambda x: x.metrics[primary_key], reverse=True
-            )
-            self.save_search_checkpoint(verbose=True)
-        else:
-            print_rank_0(f"\nUsing top {top_k} candidates from checkpoint")
-        top_k_candidates = self.all_candidates_per_constraint[constraints_cache_key][:top_k]
-
-        table = Table(title=f"Top {top_k} Candidates", show_header=True, header_style="bold")
-        table.add_column("#", justify="right", style="dim", no_wrap=True)
-        table.add_column("export_config", overflow="fold")
-        for k in active_metric_keys:
-            table.add_column(k, justify="right")
-        for i, candidate in enumerate(top_k_candidates, 1):
-            row = [str(i), rich_escape(str(candidate.ss_config))]
-            row += [self._fmt_metric(candidate.metrics[k], k) for k in active_metric_keys]
-            table.add_row(*row)
-        _rprint(table)
-
-        # 3. Optional Knowledge Distillation (KD) step for all top-k candidates
-        _rprint(
-            f"[yellow]\nSkipping optional Knowledge Distillation (KD) step for candidates as it is a manual step. "
-            "As per the original paper (https://arxiv.org/pdf/2407.14679), ideally we need to perform a short "
-            f"Knowledge Distillation on ~2B tokens for all top {top_k} candidates before evaluating the "
-            "`score_func`, which will take a lot longer to prune, require splitting the pruning process into multiple "
-            "stages and a lot more compute for pruning but can lead to better pruned model selection. If you are "
-            f"interested to do this, you can take the top {top_k} candidates' `export_config` from the logs above and "
-            "then export all models separately and perform Knowledge Distillation on each of them before evaluating "
-            f"the `score_func`.\n[/yellow]"
-        )
-
-        # 4. Validate top-k candidates using the score_func and return the best subnet
-        # WAR for Nemotron-3-Nano-30B-A3B-BF16. Disable expert bias during candidate eval to prevent in-place
-        # __setattr__ on dynamically-sliced buffers from corrupting their shape (128 -> 120 elements).
-        _routers_with_expert_bias = []
-        for n, m in self.model.named_modules():
-            if hasattr(m, "enable_expert_bias") and m.enable_expert_bias:
-                print(
-                    f"Temporarily disabling expert bias for {n} on rank {dist.rank()} for candidate evaluation..."
-                )
-                m.enable_expert_bias = False
-                _routers_with_expert_bias.append(m)
-
-        for candidate in tqdm(
-            top_k_candidates,
-            desc=f"Validating top {top_k} candidates on given score_func (this will take some time)...",
-            disable=not dist.is_master(),
-            smoothing=0.7,
-        ):
-            if candidate.score is None:  # not restored from checkpoint
-                all_layers = self.model.decoder.layers
-                start_layer_number = all_layers[0].layer_number
-
-                self._prune(candidate.ss_config, prune_depth=True)
-                candidate.score = self.eval_score(silent=False)
-                self.save_search_checkpoint(verbose=False)
-
-                # reset to max subnet and revert dropped layers
-                sample(self.model, sample_func=max)
-                for layer in all_layers:
-                    layer.layer_number = start_layer_number
-                    start_layer_number += 1
-                self.model.decoder.layers = all_layers
-            metrics_str = ", ".join(
-                f"{self._fmt_metric(v, k)} {k}" for k, v in candidate.metrics.items()
-            )
-            print_rank_0(f"\t{candidate.ss_config} -> {metrics_str}, {candidate.score:.4f} score\n")
-
-        for m in _routers_with_expert_bias:
-            m.enable_expert_bias = True
-
-        scored_table = Table(
-            title=f"Top {top_k} Candidates with Scores", show_header=True, header_style="bold"
-        )
-        scored_table.add_column("#", justify="right", style="dim", no_wrap=True)
-        scored_table.add_column("export_config")
-        for k in active_metric_keys:
-            scored_table.add_column(k, justify="right")
-        scored_table.add_column("score", justify="right")
-        for i, candidate in enumerate(top_k_candidates, 1):
-            row = [str(i), rich_escape(str(candidate.ss_config))]
-            row += [self._fmt_metric(candidate.metrics[k], k) for k in active_metric_keys]
-            row.append(f"{candidate.score:.4f}")
-            scored_table.add_row(*row)
-        _rprint(scored_table)
-
-        dist.barrier()
-        best = max(top_k_candidates, key=lambda x: x.score)  # type: ignore[arg-type, return-value]
-        best_grid = Table.grid(padding=(0, 2))
-        best_grid.add_column(style="bold green", no_wrap=True)
-        best_grid.add_column()
-        best_grid.add_row("export_config", rich_escape(str(best.ss_config)))
-        for k, v in best.metrics.items():
-            best_grid.add_row(k, self._fmt_metric(v, k))
-        best_grid.add_row("score", f"{best.score:.4f}")
-        _rprint(
-            Panel(best_grid, title="[bold green]Best Subnet[/bold green]", border_style="green")
-        )
-        return best.ss_config
-
-    def _fmt_metric(self, value: float, constraint_key: str) -> str:
-        """Format a metric value for display."""
-        return f"{value:.3f} MB" if constraint_key == "memory_mb" else num2hrb(value)
-
-    @staticmethod
-    def _generate_search_space_combos(
-        search_space: dict[str, list],
-        max_width_pruning: float = 0.40,
-        max_depth_pruning: float = 0.20,
-        hparams_to_skip: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Generate all possible combinations of hyperparameters from the search space.
-
-        Args:
-            search_space: Dictionary mapping hyperparameter names to their possible sorted choices.
-                        Example: {"hidden_size": [1024, 2048, 3072, 4096], "num_layers": [1, 2, ..., 31, 32]}
-            max_width_pruning: Maximum fraction of width hyperparameters to prune (default: 0.40).
-                            Only top (1 - max_width_pruning) choices will be considered.
-            max_depth_pruning: Maximum fraction of depth hyperparameters to prune (default: 0.20).
-                            Only top (1 - max_depth_pruning) choices will be considered.
-            hparams_to_skip: List of hparams to skip during the search (default: None).
-
-        Returns:
-            List of configuration dictionaries, where each dictionary maps hyperparameter
-            names to their chosen values. Example:
-            [
-                {"hidden_size": 1024, "num_layers": 1},
-                {"hidden_size": 1024, "num_layers": 2},
-                ...
-                {"hidden_size": 4096, "num_layers": 32},
-            ]
-        """
-        if hparams_to_skip:
-            search_space = dict(search_space)  # Avoid modifying the original search space
-            print_rank_0(f"Skipping {hparams_to_skip=} during search space generation...")
-            for hparam in hparams_to_skip:
-                if hparam in search_space:
-                    search_space.pop(hparam)
-                else:
-                    warn(f"Hparam {hparam} not found in search space! Skipping...")
-
-        filtered_ss = {
-            k: (
-                sorted(v)[int((1 - max_depth_pruning) * len(v)) :]
-                if k == "num_layers"
-                else sorted(v)[int((1 - max_width_pruning) * len(v)) :]
-            )
-            for k, v in search_space.items()
-            if len(v) > 1
-        }
-
-        ss_size = 1
-        table = Table(
-            title=f"Search Space \n(≤{max_width_pruning * 100:.0f}% width / ≤{max_depth_pruning * 100:.0f}% depth pruning)",  # noqa: E501
-            show_header=True,
-            header_style="bold",
-        )
-        table.add_column("Hyperparameter")
-        table.add_column("Choices", overflow="fold")
-        for k, v in filtered_ss.items():
-            table.add_row(k, rich_escape(str(v)))
-            ss_size *= len(v)
-        table.add_section()
-        table.add_row("Search space size", f"{ss_size}")
-        _rprint(table)
-
-        hparam_names = list(filtered_ss.keys())
-        hparam_choices_lists = [filtered_ss[name] for name in hparam_names]
-
-        search_space_combos = [
-            dict(zip(hparam_names, choices)) for choices in product(*hparam_choices_lists)
-        ]
-        assert len(search_space_combos) == ss_size
-
-        return search_space_combos
-
-    def _compute_candidate_metrics(self, ss_config: dict, max_num_layers: int) -> dict[str, float]:
-        """Compute all active metric constraint values for a candidate config analytically.
-
-        Handles depth pruning by filtering the hybrid layer pattern to the kept (best) layers.
-        """
-        model = self.model
-        active_metric_keys = self.constraints.keys() & _METRIC_CONSTRAINTS
-
-        hybrid_layer_pattern: str | None = None
-        hybrid_key = _get_hybrid_pattern_key(model)
-        if hybrid_key is not None:
-            hybrid_layer_pattern = getattr(model, hybrid_key)
-
-        # If depth pruning on a hybrid model, filter the pattern to only the kept layers.
-        # sorted_layers gives layer numbers (1-indexed) ordered best-first; we keep the top N.
-        num_layers_target: int = ss_config.get("num_layers", max_num_layers)
-        if hybrid_layer_pattern is not None and num_layers_target < max_num_layers:
-            assert self.sorted_layers is not None
-            kept = set(self.sorted_layers[:num_layers_target])
-            layer_chars = parse_main_layer_chars(hybrid_layer_pattern)
-            hybrid_layer_pattern = "".join(c for i, c in enumerate(layer_chars) if (i + 1) in kept)
-
-        metrics: dict[str, float] = {}
-
-        if active_metric_keys & {"params", "active_params"}:
-            total, active = mcore_param_count(
-                model.config,
-                model.vocab_size,
-                model.share_embeddings_and_output_weights,
-                hybrid_layer_pattern=hybrid_layer_pattern,
-                **ss_config,
-            )
-            if "params" in active_metric_keys:
-                metrics["params"] = total
-            if "active_params" in active_metric_keys:
-                metrics["active_params"] = active
-
-        if "memory_mb" in active_metric_keys:
-            _, _, _, metrics["memory_mb"] = mcore_memory_footprint_mb(
-                model.config,
-                model.vocab_size,
-                model.share_embeddings_and_output_weights,
-                hybrid_layer_pattern=hybrid_layer_pattern,
-                dtype_bytes=2,  # assume BF16 input
-                sequence_length=self.config["seq_length"],
-                batch_size=self.config["batch_size"],
-                **ss_config,
-            )
-
-        return metrics
-
-
-_HYBRID_DIVISORS = {
-    "hidden_size_divisor": 256,
-    "ffn_hidden_size_divisor": 512,
-    "mamba_head_dim_divisor": 8,
-    "num_moe_experts_divisor": 8,
-    "num_layers_divisor": 2,
-}
 
 MCoreMinitronConfig: type[ModeloptBaseConfig] = create_model(
     "MCoreMinitronConfig",
@@ -750,13 +316,22 @@ MCoreMinitronConfig: type[ModeloptBaseConfig] = create_model(
         registry=DMRegistry,
         default_rules={
             "megatron.core.models.gpt.GPTModel": {
-                "hidden_size_divisor": 256,
-                "ffn_hidden_size_divisor": 512,
-                "num_moe_experts_divisor": 8,
-                "num_layers_divisor": 2,
+                "hidden_size_divisor": 64,
+                "ffn_hidden_size_divisor": 64,
+                "num_moe_experts_divisor": 1,
             },
-            **({"megatron.core.models.mamba.MambaModel": _HYBRID_DIVISORS} if HAS_MAMBA else {}),
-            **({"megatron.core.models.hybrid.HybridModel": _HYBRID_DIVISORS} if HAS_HYBRID else {}),
+            **(
+                {
+                    "megatron.core.models.mamba.MambaModel": {
+                        "hidden_size_divisor": 64,
+                        "ffn_hidden_size_divisor": 64,
+                        "mamba_head_dim_divisor": 4,
+                        "num_moe_experts_divisor": 1,
+                    }
+                }
+                if HAS_MAMBA
+                else {}
+            ),
         },
         doc='Configuration for the ``"mcore_minitron"`` mode.',
     ),
@@ -764,30 +339,23 @@ MCoreMinitronConfig: type[ModeloptBaseConfig] = create_model(
 
 
 def get_mcore_minitron_config(
-    *,
-    hidden_size_divisor: int = 256,
-    ffn_hidden_size_divisor: int = 512,
-    mamba_head_dim_divisor: int = 8,
-    num_moe_experts_divisor: int = 8,
-    num_layers_divisor: int = 2,
+    channel_divisor: int = 64,
+    mamba_head_dim_divisor: int = 4,
+    num_moe_experts_divisor: int = 1,
 ) -> ModeloptBaseConfig:
-    """Get a MCoreMinitronConfig with the given divisors instead of default."""
+    """Get a MCoreMinitronConfig with the given channel divisor instead of default."""
     config = MCoreMinitronConfig()
 
     def _set_divisors(c):
         for k, v in c.items():
             if isinstance(v, dict):
                 _set_divisors(v)
-            elif k == "hidden_size_divisor":
-                c[k] = hidden_size_divisor
-            elif k == "ffn_hidden_size_divisor":
-                c[k] = ffn_hidden_size_divisor
+            elif k in ["hidden_size_divisor", "ffn_hidden_size_divisor"]:
+                c[k] = channel_divisor
             elif k == "mamba_head_dim_divisor":
                 c[k] = mamba_head_dim_divisor
             elif k == "num_moe_experts_divisor":
                 c[k] = num_moe_experts_divisor
-            elif k == "num_layers_divisor":
-                c[k] = num_layers_divisor
 
     _set_divisors(config)
     return config
@@ -893,10 +461,14 @@ class ImportanceEstimatorRegistry:
         for module in self.model.modules():
             if isinstance(module, _DynamicMCoreLanguageModel):
                 _register_hidden_size_importance(module, self)
-            elif isinstance(module, (_DynamicTransformerLayer, _DynamicMambaLayer)):
+            elif isinstance(module, (_DynamicTransformerLayer, _DynamicMambaLayer)) or (
+                HAS_V4 and isinstance(module, _DynamicHyperConnectionTransformerLayer)
+            ):
                 _register_depth_cosine_importance(module, self)
             elif isinstance(module, _DynamicSelfAttention):
                 _register_self_attention_importance(module, self)
+            elif HAS_V4 and isinstance(module, _DynamicV4SelfAttention):
+                pass  # V4 MLA importance is handled via input_layernorm hooks in hidden_size importance
             elif isinstance(module, _DynamicMLP):
                 _register_mlp_importance(module, self)
             elif isinstance(module, _DynamicSequentialMLP):
@@ -955,11 +527,6 @@ class ImportanceEstimatorRegistry:
             handle.remove()
         self._hooks.clear()
 
-        # Unpatch return_layernorm_output on fused TELayerNormColumnParallelLinear modules
-        for m in self.model.modules():
-            if isinstance(m, TELayerNormColumnParallelLinear):
-                m.return_layernorm_output = False
-
     def get_layer_scores(self) -> dict[int, torch.Tensor]:
         """Get the layer scores (1-indexed) from the model.
 
@@ -975,51 +542,54 @@ class ImportanceEstimatorRegistry:
         layer_scores = {}
         for layer in self.model.decoder.layers:
             layer_scores[layer.layer_number] = layer._scores
-        pp_group = dist.DistributedProcessGroup(get_pipeline_model_parallel_group())
-        layer_scores = dist.DistributedProcessGroup.get_dist_syncd_obj(
-            layer_scores,
-            pp_group,
-            op=lambda all_pp_layer_scores: {
-                k: v for d in all_pp_layer_scores for k, v in d.items()
-            },
+        all_pp_layer_scores = [None] * get_pipeline_model_parallel_world_size()
+        torch.distributed.all_gather_object(
+            all_pp_layer_scores, layer_scores, group=get_pipeline_model_parallel_group()
         )
+        layer_scores = {k: v for d in all_pp_layer_scores for k, v in d.items()}  # type: ignore[attr-defined]
         print_rank_0(f"Layerwise scores (1-indexed, higher is better): {layer_scores}")
         assert sorted(layer_scores.keys()) == list(range(1, num_layers_hp.max + 1))  # type: ignore[arg-type]
 
         return layer_scores
 
-    def get_local_activations_and_layer_scores(
+    def get_activations_and_layer_scores(
         self,
-    ) -> tuple[dict[str, torch.Tensor], dict[int, torch.Tensor]]:
-        """Get this rank's local activations and global layer scores from the model.
+    ) -> tuple[list[dict[str, torch.Tensor]], dict[int, torch.Tensor]]:
+        """Get the per-rank activations and layer scores from the model."""
+        local_activations = {}
+        for n, m in self.model.named_modules():
+            if hasattr(m, "_activations"):
+                local_activations[n] = m._activations
+        activations_per_rank = dist.allgather(
+            local_activations, group=get_pipeline_model_parallel_group()
+        )
+        assert len(activations_per_rank) == get_pipeline_model_parallel_world_size()
 
-        Each rank saves its own activations to its per-rank checkpoint file (no allgather needed).
-        Layer scores are gathered across all PP ranks to produce a global ranking.
-        """
-        local_activations = {
-            n: m._activations for n, m in self.model.named_modules() if hasattr(m, "_activations")
-        }
         layer_scores = self.get_layer_scores()
 
-        return local_activations, layer_scores
+        return activations_per_rank, layer_scores
 
-    def set_local_activations_and_layer_scores(
+    def set_activations_and_layer_scores(
         self,
-        local_activations: dict[str, torch.Tensor],
+        activations_per_rank: list[dict[str, torch.Tensor]],
         layer_scores: dict[int, torch.Tensor],
     ) -> None:
-        """Set the pre-computed layer_scores and local activations instead of running forward.
+        """Set the pre-computed layer_scores and per-rank activations instead of running forward.
 
         Args:
-            local_activations: Dict from module name to activations for this rank.
-            layer_scores: Dict from layer_number (1-indexed) to score (global across all PP ranks).
+            activations_per_rank: List of dicts from module name to activations. Should match PP size.
+            layer_scores: Dict from layer_number (1-indexed) to score.
         """
-        print_rank_0("Loading activations and scores from per-rank checkpoint...")
+        rank = get_pipeline_model_parallel_rank()
+        pp_size = get_pipeline_model_parallel_world_size()
+        assert len(activations_per_rank) == pp_size, (
+            f"Expected same PP size for stored pruning scores ({len(activations_per_rank)}) as current ({pp_size})!"
+        )
         for layer in self.model.decoder.layers:
             layer._scores = layer_scores[layer.layer_number]
         for n, m in self.model.named_modules():
             if hasattr(m, "_activations"):
-                m._activations = local_activations[n]
+                m._activations = activations_per_rank[rank][n]
 
 
 # Module-specific registration functions
@@ -1029,48 +599,25 @@ def _register_hidden_size_importance(
     """Register importance estimators for Language Model (GPT/Mamba) modules."""
     module._register_temp_attribute("_activations", {})
 
-    def _collect_activations(mod, module_id, activations_tensor):
-        """Accumulate activation importance scores for a given module."""
-        activations_tensor = activations_tensor.to(torch.float32)
-        activations = activations_tensor.abs().mean(dim=0)  # [batch_size, hidden_size]
-        activations = activations.pow(2).sum(dim=0)
-        if module_id not in mod._activations:
-            mod._activations[module_id] = activations
-        else:
-            mod._activations[module_id] += (
-                activations  # aggregate sum instead of mean of scores for simplicity
-            )
+    def _emb_layernorm_forward_hook(mod, module_inner, input, output):
+        """Hook to collect activations for importance estimation.
 
-    def _fused_ln_linear_forward_hook(mod, module_inner, input, output):
-        """Hook on TELayerNormColumnParallelLinear with return_layernorm_output=True.
-
-        Extracts the exact layernorm output from TE's fused kernel and restores
-        the normal return format so downstream code is not affected.
+        Activations are computed as mean over seq_len and then squared and summed over batch_size.
+        Later we take the square root of the sum to get the L2 norm.
         """
-        # Output format with return_layernorm_output=True:
-        #   te_return_bias=True:  MCore returns (linear_out, bias, ln_out)
-        #   te_return_bias=False: MCore returns ((linear_out, ln_out), None)
-        if module_inner.te_return_bias:
-            linear_out, bias, ln_out = output
-            fixed_output = (linear_out, bias)
-        else:
-            (linear_out, ln_out), bias = output
-            fixed_output = (linear_out, bias)
-
-        # Gather over all TP regions
-        # NOTE: This is not used at the moment since we restrict to TP=1
-        ln_out = gather_from_tensor_model_parallel_region(ln_out).detach()
-        _collect_activations(mod, id(module_inner), ln_out)
-
-        # Return the normal output format so downstream code (e.g. SelfAttention) is not affected
-        return fixed_output
-
-    def _layernorm_forward_hook(mod, module_inner, input, output):
-        """Hook on separate layernorm modules (e.g. TENorm for MoE pre_mlp_layernorm)."""
         # Gather output [seq_len, batch_size, hidden_size] over all TP regions
         # NOTE: This is not used at the moment since we restrict to TP=1
         output = gather_from_tensor_model_parallel_region(output).detach()
-        _collect_activations(mod, id(module_inner), output)
+
+        output = output.to(torch.float32)  # use full precision to avoid overflow
+        activations = output.abs().mean(dim=0)  # [batch_size, hidden_size]
+        activations = activations.pow(2).sum(dim=0)
+        if id(module_inner) not in mod._activations:
+            mod._activations[id(module_inner)] = activations
+        else:
+            mod._activations[id(module_inner)] += (
+                activations  # aggregate sum instead of mean of scores for simplicity
+            )
 
     def _estimate_hidden_size_importance(mod):
         """Return the activation magnitude-based importance of the hidden_size."""
@@ -1084,44 +631,29 @@ def _register_hidden_size_importance(
         torch.distributed.all_reduce(activations, op=torch.distributed.ReduceOp.SUM)
         return activations
 
-    # Register hooks to collect post-layernorm activations for hidden_size importance.
-    # Layernorms are fused into TELayerNormColumnParallelLinear. We temporarily
-    # patch return_layernorm_output=True so TE's fused kernel returns the layernorm output.
-    # For MoE layers, pre_mlp_layernorm is a separate TENorm — use a regular forward hook.
-    for m in module.modules():
-        if isinstance(m, TELayerNormColumnParallelLinear):
-            m.return_layernorm_output = True
-
+    # Register hooks for all layers
     for layer in module.decoder.layers:
-        if isinstance(layer, _DynamicTransformerLayer):
-            if isinstance(layer.self_attention, _DynamicSelfAttention):
-                # input_layernorm is fused into self_attention.linear_qkv
+        if isinstance(layer, _DynamicTransformerLayer) or (
+            HAS_V4 and isinstance(layer, _DynamicHyperConnectionTransformerLayer)
+        ):
+            if isinstance(layer.self_attention, (_DynamicSelfAttention,)) or (
+                HAS_V4 and isinstance(layer.self_attention, _DynamicV4SelfAttention)
+            ):
                 registry.register_hook(
-                    layer.self_attention.linear_qkv,
-                    partial(_fused_ln_linear_forward_hook, module),
+                    layer.input_layernorm,
+                    partial(_emb_layernorm_forward_hook, module),
                     hook_type="forward",
                 )
 
-            if isinstance(layer.mlp, _DynamicMoELayer):
-                # MoE layers have a separate pre_mlp_layernorm (TENorm, not IdentityOp)
+            if isinstance(layer.mlp, (_DynamicMLP, _DynamicSequentialMLP)):
                 registry.register_hook(
                     layer.pre_mlp_layernorm,
-                    partial(_layernorm_forward_hook, module),
-                    hook_type="forward",
-                )
-            elif isinstance(layer.mlp, _DynamicMLP):
-                # Dense MLP: pre_mlp_layernorm is fused into mlp.linear_fc1
-                registry.register_hook(
-                    layer.mlp.linear_fc1,
-                    partial(_fused_ln_linear_forward_hook, module),
+                    partial(_emb_layernorm_forward_hook, module),
                     hook_type="forward",
                 )
         elif isinstance(layer, _DynamicMambaLayer):
-            # Mamba norm is fused into mixer.in_proj
             registry.register_hook(
-                layer.mixer.in_proj,
-                partial(_fused_ln_linear_forward_hook, module),
-                hook_type="forward",
+                layer.norm, partial(_emb_layernorm_forward_hook, module), hook_type="forward"
             )
 
     registry.register_importance(
@@ -1139,7 +671,9 @@ def _register_depth_cosine_importance(
         """Hook to collect cosine similarity between input and output to rank layers for depth pruning."""
         hidden_states = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
 
-        if isinstance(mod, _DynamicTransformerLayer):
+        if isinstance(mod, _DynamicTransformerLayer) or (
+            HAS_V4 and isinstance(mod, _DynamicHyperConnectionTransformerLayer)
+        ):
             output, _ = output  # [seq_len, batch_size, hidden_size]
 
         # use full precision to avoid overflow

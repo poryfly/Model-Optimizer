@@ -51,8 +51,24 @@ from transformers import AutoConfig, AutoModelForCausalLM
 import modelopt.torch.opt as mto
 import modelopt.torch.prune as mtp
 import modelopt.torch.utils.distributed as dist
-from modelopt.torch.export import copy_hf_ckpt_remote_code
-from modelopt.torch.utils import get_supported_datasets, print_args, print_rank_0, warn_rank_0
+try:
+    from modelopt.torch.export import copy_hf_ckpt_remote_code
+except ImportError:
+    def copy_hf_ckpt_remote_code(src, dst):
+        pass
+from modelopt.torch.utils import print_rank_0
+try:
+    from modelopt.torch.utils import get_supported_datasets, print_args, warn_rank_0
+except ImportError:
+    def print_args(args):
+        for k, v in sorted(vars(args).items()):
+            print_rank_0(f"  {k}: {v}")
+    def warn_rank_0(*a, **kw):
+        import warnings
+        if True:  # always warn on rank 0
+            warnings.warn(*a, **kw)
+    def get_supported_datasets():
+        return []
 from modelopt.torch.utils.plugins.mbridge import load_mbridge_model_from_hf
 from modelopt.torch.utils.plugins.megatron_calibration import get_megatron_calibration_forward_loop
 from modelopt.torch.utils.plugins.megatron_mmlu import megatron_mmlu
@@ -458,6 +474,33 @@ def main(args: argparse.Namespace):
             hf_cfg.layer_types = [
                 lt for i, lt in enumerate(hf_cfg.layer_types) if i + 1 in kept_layer_nums
             ]
+        # V4-specific config fields
+        if hasattr(mcore_cfg, "compress_ratios") and mcore_cfg.compress_ratios is not None:
+            hf_cfg.compress_ratios = list(mcore_cfg.compress_ratios)
+            if "num_layers" in (pruning_scores.get("sorted_layers") or []):
+                kept = pruning_scores["sorted_layers"][: mcore_cfg.num_layers]
+                hf_cfg.compress_ratios = [
+                    r for i, r in enumerate(hf_cfg.compress_ratios) if (i + 1) in kept
+                ]
+        for v4_field in (
+            "num_hash_layers",
+            "mlp_layer_types",
+            "swiglu_limit",
+            "hc_mult",
+            "hc_sinkhorn_iters",
+            "o_lora_rank",
+            "o_groups",
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_head_dim",
+            "v_head_dim",
+            "qk_rope_head_dim",
+            "index_n_heads",
+            "index_head_dim",
+            "index_topk",
+        ):
+            if hasattr(mcore_cfg, v4_field) and hasattr(hf_cfg, v4_field):
+                setattr(hf_cfg, v4_field, getattr(mcore_cfg, v4_field))
         if isinstance(provider, MambaModelProvider) and hasattr(hf_cfg, "hybrid_override_pattern"):
             hf_cfg.hybrid_override_pattern = getattr(unwrapped_model, hybrid_key)
         hf_cfg.num_hidden_layers = mcore_cfg.num_layers

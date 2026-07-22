@@ -13,17 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Handles nas plugins for third-party modules."""
+"""Handles tracing plugins for third-party modules."""
 
 from modelopt.torch.utils import import_plugin
-
-from .torch import *
-
-with import_plugin("megatron"):
-    from .megatron import *
-
-with import_plugin("transformer engine"):
-    from .transformer_engine import *
 
 with import_plugin("transformers"):
     from .transformers import *

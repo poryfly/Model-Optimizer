@@ -135,7 +135,9 @@ class SearchSpace(DynamicSpace):
             hps_to_sort: A set of hparam names to sort. If not provided or empty, all hparams will be sorted.
             verbose: Whether to print the search space and hparam importances.
         """
-        print_rank_0("\nSorting parameters...")
+        print_rank_0("Sorting parameters...")
+        if verbose:
+            self.print_summary()
 
         # get config and set to max
         config = self.config()
