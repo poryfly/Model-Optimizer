@@ -31,57 +31,43 @@ set -euo pipefail
 
 # ---- 1. 环境 / 路径 ----
 WORKSPACE=${WORKSPACE:-/workdir}
-BRIDGE_DIR=${BRIDGE_DIR:-/workdir/Megatron-Bridge}
+BRIDGE_DIR=${BRIDGE_DIR:-/workdir/dpsk-v4-train/train/Megatron-Bridge}
 
 # ---- 2. Recipe / 数据 ----
 RECIPE_NAME=deepseek_v4_pruned_pretrain_8gpu_bf16_config
 DATASET_NAME=local                                        # "mock" 或 "local"
-DATASET_BLEND_PATH="/workdir/data/recovery_cpt_seq2k_text_document"
-SEQ_LENGTH=2048
+DATASET_BLEND_PATH="/workdir/dpsk-v4-train/data/pre_token_dataset/recovery_cpt_seq4k_text_document"
+SEQ_LENGTH=4096
 
 # ---- 3. 训练参数 ----
-TRAIN_ITERS=6000                                         # 1 epoch
-GLOBAL_BATCH_SIZE=256
+TRAIN_ITERS=3000                                         # 1 epoch
+GLOBAL_BATCH_SIZE=512
 MICRO_BATCH_SIZE=1
-EVAL_INTERVAL=0                                           # 0 = disabled
+EVAL_INTERVAL=50                                           # 0 = disabled
 EVAL_ITERS=0
 LR_WARMUP_ITERS=40
-SAVE_INTERVAL=1000
-LOG_INTERVAL=5
-CHECKPOINT_KEEP_LIMIT=3                                   # 保留最近 N 个 checkpoint
+SAVE_INTERVAL=100
+LOG_INTERVAL=10
+CHECKPOINT_KEEP_LIMIT=5                                   # 保留最近 N 个 checkpoint
 SEED=1234
-echo "resume 1"
 
-# ---- 4. 并行配置 (TP,PP,EP,CP; 8 GPUs: 1*1*8*1=8) ----
-PARALLELISM_CONFIG=${PARALLELISM_CONFIG:-1,1,8,1}
+# ---- 4. 并行配置 (TP,PP,EP,CP; 8 GPUs: 1*2*4*1=8) ----
+PARALLELISM_CONFIG=1,2,4,1
 
 # ---- 5. Checkpoint 加载 / 保存 ----
 PRETRAINED_CHECKPOINT=""                                  # resume 不使用 HF 加载
-RESUME_FROM_DIR="/workdir/model_output/phase0_recipe_callback/checkpoints"
-RESUME_CKPT_STEP="1000"                                  # 空字符串 = 自动选择最新
+RESUME_FROM_DIR="/workdir/dpsk-v4-train/train/Megatron-Bridge-model-output/checkpoints"  # 修改为要 resume 的 checkpoint 目录
+RESUME_CKPT_STEP=""                                       # 空字符串 = 自动选择最新
 FINETUNE=false                                            # resume 不重置训练状态
 NO_LOAD_OPTIM=false                                       # resume 加载优化器状态
 NO_LOAD_RNG=false                                         # resume 加载 RNG 状态
 NO_SAVE_OPTIM=false                                       # resume 保存优化器状态
 NO_SAVE_RNG=false                                         # resume 保存 RNG 状态
 
-echo "resume 1.1"
 # ---- 6. 输出 / 日志 ----
-OUTPUT_DIR="/workdir/model_output/phase0_recipe_callback"
-# resume 时复用该 OUTPUT_DIR 下最新的 tb_logs/run_* 子目录，保持同一个 run；
-# 如果没有则新建一个带时间戳的子目录。
-if [ -z "${TENSORBOARD_DIR:-}" ]; then
-    echo "resume 1.2"
-    LATEST_TB_DIR=$(find "${OUTPUT_DIR}/tb_logs" -maxdepth 1 -type d -name 'run_*' 2>/dev/null | sort | tail -n 1)
-    echo ${LATEST_TB_DIR}
-    echo "resume 1.3"
-    if [ -n "$LATEST_TB_DIR" ]; then
-        TENSORBOARD_DIR="$LATEST_TB_DIR"
-    else
-        TENSORBOARD_DIR="${OUTPUT_DIR}/tb_logs/run_$(date +%Y%m%d_%H%M%S)"
-    fi
-fi
-echo "resume 2"
+OUTPUT_DIR="/workdir/dpsk-v4-train/train/Megatron-Bridge-model-output/resume"
+# TensorBoard 每次新训练自动创建带时间戳的子目录，避免多个 run 的 events 文件混在一起
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tb_logs/run_$(date +%Y%m%d_%H%M%S)}"
 
 # ---- 7. Kernel / Attention 优化 (与 swift 框架对齐) ----
 # 这些参数直接影响显存占用和训练速度，H20 上建议全部开启

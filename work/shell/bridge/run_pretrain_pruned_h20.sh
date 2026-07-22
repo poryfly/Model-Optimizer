@@ -1,22 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# DeepSeek-V4 Pruned (dpsk-v4-4B-A1.5B) Resume Training — Single-Node 8-GPU
-#
-# Resumes from a previous Megatron checkpoint run using checkpoint.load
-# (Full native Megatron resume). Restores weights + step + scheduler + optim + rng.
-#
-# Key differences from run_pretrain_pruned.sh:
-#   - PRETRAINED_CHECKPOINT=""   (no HF loading; use checkpoint.load instead)
-#   - RESUME_FROM_DIR=<path>     (base dir of previous run's checkpoints)
-#   - FINETUNE=false             (don't reset iteration)
-#   - NO_LOAD_OPTIM/NO_LOAD_RNG=false  (load optimizer + rng state)
-#   - NO_SAVE_OPTIM/NO_SAVE_RNG=false  (save optimizer + rng state)
+# DeepSeek-V4 Pruned (dpsk-v4-4B-A1.5B) Pretraining — Single-Node 8-GPU
 #
 # This script follows the official slurm_pretrain.sh pattern but is adapted for
 # a local single-node setup (no Slurm, no container).
 #
 # Usage:
-#   bash resume_pretrain_pruned.sh
+#   bash run_pretrain_pruned.sh
 #
 # The recipe (deepseek_v4_pruned_pretrain_8gpu_bf16_config) hardcodes the model
 # path. All other parameters are overridable via CLI_OVERRIDES (key=value format),
@@ -31,57 +21,41 @@ set -euo pipefail
 
 # ---- 1. 环境 / 路径 ----
 WORKSPACE=${WORKSPACE:-/workdir}
-BRIDGE_DIR=${BRIDGE_DIR:-/workdir/Megatron-Bridge}
+BRIDGE_DIR=${BRIDGE_DIR:-/workdir/dpsk-v4-train/train/Megatron-Bridge}
 
 # ---- 2. Recipe / 数据 ----
 RECIPE_NAME=deepseek_v4_pruned_pretrain_8gpu_bf16_config
 DATASET_NAME=local                                        # "mock" 或 "local"
-DATASET_BLEND_PATH="/workdir/data/recovery_cpt_seq2k_text_document"
-SEQ_LENGTH=2048
+DATASET_BLEND_PATH="/workdir/dpsk-v4-train/data/pre_token_dataset/recovery_cpt_seq4k_text_document"
+SEQ_LENGTH=4096
 
 # ---- 3. 训练参数 ----
-TRAIN_ITERS=6000                                         # 1 epoch
-GLOBAL_BATCH_SIZE=256
+TRAIN_ITERS=3000                                         # 1 epoch
+GLOBAL_BATCH_SIZE=512
 MICRO_BATCH_SIZE=1
-EVAL_INTERVAL=0                                           # 0 = disabled
+EVAL_INTERVAL=50                                           # 0 = disabled
 EVAL_ITERS=0
 LR_WARMUP_ITERS=40
-SAVE_INTERVAL=1000
-LOG_INTERVAL=5
-CHECKPOINT_KEEP_LIMIT=3                                   # 保留最近 N 个 checkpoint
+SAVE_INTERVAL=100
+LOG_INTERVAL=10
+CHECKPOINT_KEEP_LIMIT=5                                   # 保留最近 N 个 checkpoint
 SEED=1234
-echo "resume 1"
 
 # ---- 4. 并行配置 (TP,PP,EP,CP; 8 GPUs: 1*1*8*1=8) ----
-PARALLELISM_CONFIG=${PARALLELISM_CONFIG:-1,1,8,1}
+PARALLELISM_CONFIG=1,2,4,1
 
 # ---- 5. Checkpoint 加载 / 保存 ----
-PRETRAINED_CHECKPOINT=""                                  # resume 不使用 HF 加载
-RESUME_FROM_DIR="/workdir/model_output/phase0_recipe_callback/checkpoints"
-RESUME_CKPT_STEP="1000"                                  # 空字符串 = 自动选择最新
-FINETUNE=false                                            # resume 不重置训练状态
-NO_LOAD_OPTIM=false                                       # resume 加载优化器状态
-NO_LOAD_RNG=false                                         # resume 加载 RNG 状态
-NO_SAVE_OPTIM=false                                       # resume 保存优化器状态
-NO_SAVE_RNG=false                                         # resume 保存 RNG 状态
+PRETRAINED_CHECKPOINT="/workdir/dpsk-v4-train/train/deepseekv4_train/megatron_output/dpsk-v4-4B-A1.5B_pt_monitor/v14-20260708-174803/checkpoint-8000"  # 空字符串 = random init
+FINETUNE=true                                             # true=从HF加载后重置训练状态
+NO_LOAD_OPTIM=true                                        # true=不加载优化器状态
+NO_LOAD_RNG=true                                          # true=不加载 RNG 状态
+NO_SAVE_OPTIM=false                                       # false=保存优化器状态
+NO_SAVE_RNG=false                                         # false=保存 RNG 状态
 
-echo "resume 1.1"
 # ---- 6. 输出 / 日志 ----
-OUTPUT_DIR="/workdir/model_output/phase0_recipe_callback"
-# resume 时复用该 OUTPUT_DIR 下最新的 tb_logs/run_* 子目录，保持同一个 run；
-# 如果没有则新建一个带时间戳的子目录。
-if [ -z "${TENSORBOARD_DIR:-}" ]; then
-    echo "resume 1.2"
-    LATEST_TB_DIR=$(find "${OUTPUT_DIR}/tb_logs" -maxdepth 1 -type d -name 'run_*' 2>/dev/null | sort | tail -n 1)
-    echo ${LATEST_TB_DIR}
-    echo "resume 1.3"
-    if [ -n "$LATEST_TB_DIR" ]; then
-        TENSORBOARD_DIR="$LATEST_TB_DIR"
-    else
-        TENSORBOARD_DIR="${OUTPUT_DIR}/tb_logs/run_$(date +%Y%m%d_%H%M%S)"
-    fi
-fi
-echo "resume 2"
+OUTPUT_DIR="/workdir/dpsk-v4-train/train/Megatron-Bridge-model-output"
+# TensorBoard 每次新训练自动创建带时间戳的子目录，避免多个 run 的 events 文件混在一起
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tb_logs/run_$(date +%Y%m%d_%H%M%S)}"
 
 # ---- 7. Kernel / Attention 优化 (与 swift 框架对齐) ----
 # 这些参数直接影响显存占用和训练速度，H20 上建议全部开启
@@ -115,7 +89,7 @@ MOE_MONITOR_ENABLED=true
 MOE_MONITOR_TOP_K=6                                       # DeepSeek-V4 的 top_k
 # true  → 官方 training_log 行 + callback MoE 路由指标行 (两行输出)
 # false → callback 完全替代官方 iteration log (单行输出)
-MOE_MONITOR_COMPARE_MODE=${MOE_MONITOR_COMPARE_MODE:-true}
+MOE_MONITOR_COMPARE_MODE=true
 
 # ==============================================================================
 # Environment Setup
@@ -158,7 +132,7 @@ NPROC_PER_NODE=$((TP * PP * EP))
 MASTER_PORT=${MASTER_PORT:-29571}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 
-RUN_NAME=dpsk_v4_pruned_resume_${DATASET_NAME}_tp${TP}_pp${PP}_ep${EP}
+RUN_NAME=dpsk_v4_pruned_${DATASET_NAME}_tp${TP}_pp${PP}_ep${EP}
 CHECKPOINT_DIR=${OUTPUT_DIR}/checkpoints
 
 # Build CLI overrides (pretrained_checkpoint is optional)
@@ -167,20 +141,14 @@ if [ -n "${PRETRAINED_CHECKPOINT}" ]; then
     PRETRAINED_OVERRIDES="checkpoint.pretrained_checkpoint=${PRETRAINED_CHECKPOINT}"
 fi
 
-# ckpt_step is optional: empty = Megatron auto-selects latest from latest_checkpointed_iteration.txt
-CKPT_STEP_OVERRIDE=""
-if [ -n "${RESUME_CKPT_STEP}" ]; then
-    CKPT_STEP_OVERRIDE="checkpoint.ckpt_step=${RESUME_CKPT_STEP}"
-fi
-
-# 对比模式 (MOE_MONITOR_COMPARE_MODE=true, 本脚本默认) 同时打开两套监控:
-#   - 内置 training_log() 不跳 (不设 skip_train_metrics_log) 原本 iteration log 照常打印
-#   - callback 也注册 (MOE_MONITOR_ENABLED=true), 只补充打印 MoE 路由指标
-# 对比模式关闭 (MOE_MONITOR_COMPARE_MODE=false) 时, 跳过内置 training_log, 只留 callback,
-# 与 run_pretrain_pruned.sh 行为一致
-COMPARE_LOG_OVERRIDE=""
-if [ "${MOE_MONITOR_COMPARE_MODE}" != "true" ]; then
-    COMPARE_LOG_OVERRIDE="logger.skip_train_metrics_log=true"
+# 启用 MoE 监控时, 默认保留 Megatron 官方 iteration log (对比模式),
+# callback 只补充 MoE 路由指标作为第二行。
+# 如需 callback 完全替代官方 log (单行输出), 把 MOE_MONITOR_COMPARE_MODE 改为 false
+# 并把下面的 MOE_MONITOR_LOG_OVERRIDE 取消注释。
+if [ "${MOE_MONITOR_ENABLED}" = "true" ] && [ "${MOE_MONITOR_COMPARE_MODE}" != "true" ]; then
+    MOE_MONITOR_LOG_OVERRIDE="logger.skip_train_metrics_log=true"
+else
+    MOE_MONITOR_LOG_OVERRIDE=""
 fi
 
 CLI_OVERRIDES=" \
@@ -203,12 +171,11 @@ CLI_OVERRIDES=" \
     scheduler.lr_warmup_iters=$LR_WARMUP_ITERS \
     scheduler.lr_decay_iters=$TRAIN_ITERS \
     checkpoint.save=${CHECKPOINT_DIR} \
-    checkpoint.load=${RESUME_FROM_DIR} \
-    $CKPT_STEP_OVERRIDE \
+    checkpoint.load=${CHECKPOINT_DIR} \
     checkpoint.save_interval=$SAVE_INTERVAL \
     checkpoint.most_recent_k=$CHECKPOINT_KEEP_LIMIT \
     logger.log_interval=$LOG_INTERVAL \
-    $COMPARE_LOG_OVERRIDE \
+    $MOE_MONITOR_LOG_OVERRIDE \
     model.tensor_model_parallel_size=$TP \
     model.pipeline_model_parallel_size=$PP \
     model.expert_model_parallel_size=$EP \
@@ -243,7 +210,7 @@ CMD="uv run --no-sync python -m torch.distributed.run \
     $CLI_OVERRIDES"
 
 echo "======================================"
-echo "DeepSeek-V4 Pruned Resume Training (Recipe Flow)"
+echo "DeepSeek-V4 Pruned Pretraining (Recipe Flow)"
 echo "======================================"
 echo "Recipe: $RECIPE_NAME"
 echo "Dataset: $DATASET_TYPE/$DATASET_NAME"
@@ -251,21 +218,19 @@ echo "Parallelism: TP=$TP PP=$PP EP=$EP CP=$CP"
 if [ -n "${PRETRAINED_CHECKPOINT}" ]; then
     echo "Checkpoint load: $PRETRAINED_CHECKPOINT (HF pretrained_checkpoint)"
 else
-    echo "Checkpoint load: $RESUME_FROM_DIR (resume from Megatron checkpoint)"
+    echo "Checkpoint load: none (random init, like official pretraining)"
 fi
 echo "Checkpoint save: $CHECKPOINT_DIR"
 echo "Output dir: $OUTPUT_DIR"
-echo "Resume mode: load_optim=$([ "$NO_LOAD_OPTIM" = "true" ] && echo "false" || echo "true")  load_rng=$([ "$NO_LOAD_RNG" = "true" ] && echo "false" || echo "true")  finetune=$FINETUNE"
 if [ "${MOE_MONITOR_ENABLED}" = "true" ]; then
-    echo "MoE monitor:   ENABLED  (top_k=$MOE_MONITOR_TOP_K, frequency=LOG_INTERVAL=$LOG_INTERVAL)"
+    echo "MoE monitor:    ENABLED  (top_k=$MOE_MONITOR_TOP_K, frequency=LOG_INTERVAL=$LOG_INTERVAL)"
     if [ "${MOE_MONITOR_COMPARE_MODE}" = "true" ]; then
-        echo "  MOE_MONITOR_COMPARE_MODE=true  →  同时输出 Bridge 内置 training_log 行 + callback MoE 路由指标行"
-        echo "  callback 只补充 MoE 路由指标 (router_entropy / expert_utilization / ...), 不重复 loss/lr/grad_norm"
+        echo "                 对比模式: 官方 training_log 行 + callback MoE 路由指标行 (两行输出)"
     else
-        echo "  MOE_MONITOR_COMPARE_MODE=false →  跳过 Bridge 内置 training_log, 只输出 callback 行"
+        echo "                 callback 完全替代官方 iteration log, 输出包含全部基础 + 新增指标, 用 | 分隔。"
     fi
 else
-    echo "MoE monitor:   disabled (set MOE_MONITOR_ENABLED=true to enable)"
+    echo "MoE monitor:    disabled (set MOE_MONITOR_ENABLED=true to enable)"
 fi
 echo "======================================"
 echo "$CMD"
@@ -274,7 +239,7 @@ echo "======================================"
 cd "${BRIDGE_DIR}"
 export PYTHONPATH=${BRIDGE_DIR}/src:${BRIDGE_DIR}/3rdparty/Megatron-LM:${PYTHONPATH:-}
 
-# Launch in background
+# Launch in background (like run_pretrain.sh)
 LOG_FILE="${OUTPUT_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
 PID_FILE="${OUTPUT_DIR}/train.pid"
 
@@ -288,3 +253,5 @@ echo "${TRAIN_PID}" > "${PID_FILE}"
 echo "Training PID: ${TRAIN_PID}"
 echo "  tail -f ${LOG_FILE}"
 echo "  kill -TERM \$(cat ${PID_FILE})"
+
+

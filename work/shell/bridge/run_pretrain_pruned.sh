@@ -26,26 +26,27 @@ BRIDGE_DIR=${BRIDGE_DIR:-/workdir/Megatron-Bridge}
 # ---- 2. Recipe / 数据 ----
 RECIPE_NAME=deepseek_v4_pruned_pretrain_8gpu_bf16_config
 DATASET_NAME=local                                        # "mock" 或 "local"
-DATASET_BLEND_PATH="/workdir/data/recovery_cpt_seq4k_text_document"
-SEQ_LENGTH=1024
+DATASET_BLEND_PATH="/workdir/data/recovery_cpt_seq2k_text_document"
+SEQ_LENGTH=2048
 
 # ---- 3. 训练参数 ----
-TRAIN_ITERS=20000                                         # 1 epoch
-GLOBAL_BATCH_SIZE=64
+TRAIN_ITERS=6000                                         # 1 epoch
+GLOBAL_BATCH_SIZE=256
 MICRO_BATCH_SIZE=1
 EVAL_INTERVAL=0                                           # 0 = disabled
 EVAL_ITERS=0
 LR_WARMUP_ITERS=40
 SAVE_INTERVAL=1000
 LOG_INTERVAL=5
-CHECKPOINT_KEEP_LIMIT=5                                   # 保留最近 N 个 checkpoint
+CHECKPOINT_KEEP_LIMIT=3                                   # 保留最近 N 个 checkpoint
 SEED=1234
 
 # ---- 4. 并行配置 (TP,PP,EP,CP; 8 GPUs: 1*1*8*1=8) ----
 PARALLELISM_CONFIG=${PARALLELISM_CONFIG:-1,1,8,1}
 
 # ---- 5. Checkpoint 加载 / 保存 ----
-PRETRAINED_CHECKPOINT="/workdir/model_input/checkpoint-10000"  # 空字符串 = random init
+PRETRAINED_CHECKPOINT="/workdir/model_input/dpsk-v4-4B-A1.5-headdim256"  # 空字符串 = random init
+#PRETRAINED_CHECKPOINT="/workdir/model_input/checkpoint-10000"  # 空字符串 = random init
 FINETUNE=true                                             # true=从HF加载后重置训练状态
 NO_LOAD_OPTIM=true                                        # true=不加载优化器状态
 NO_LOAD_RNG=true                                          # true=不加载 RNG 状态
@@ -53,11 +54,36 @@ NO_SAVE_OPTIM=false                                       # false=保存优化�
 NO_SAVE_RNG=false                                         # false=保存 RNG 状态
 
 # ---- 6. 输出 / 日志 ----
-OUTPUT_DIR="/workdir/model_output/phase2_recipe_callback"
+OUTPUT_DIR="/workdir/model_output/phase0_recipe_callback"
 # TensorBoard 每次新训练自动创建带时间戳的子目录，避免多个 run 的 events 文件混在一起
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tb_logs/run_$(date +%Y%m%d_%H%M%S)}"
 
-# ---- 7. MoE 监控 Callback ----
+# ---- 7. Kernel / Attention 优化 (与 swift 框架对齐) ----
+# 这些参数直接影响显存占用和训练速度，H20 上建议全部开启
+ATTENTION_BACKEND=flash                                   # flash / None，None 为自动选择
+MOE_PERMUTE_FUSION=true
+MOE_GROUPED_GEMM=true
+MOE_SHARED_EXPERT_OVERLAP=true
+
+# Activation recompute 配置
+# full: 重计算整个 transformer layer（recipe 默认值）
+# selective: 只重计算 RECOMPUTE_MODULES 指定的模块
+# DeepSeek-V4 启用 HyperConnections 时，Megatron 建议 selective + mhc 以减少显存
+#RECOMPUTE_GRANULARITY=selective
+#RECOMPUTE_METHOD=null
+#RECOMPUTE_NUM_LAYERS=null
+#RECOMPUTE_MODULES="[mhc,moe]"
+
+RECOMPUTE_GRANULARITY=full
+RECOMPUTE_METHOD=uniform
+RECOMPUTE_NUM_LAYERS=1
+RECOMPUTE_MODULES=""   # full 不需
+
+# DSA kernel fusion（H20/H100 上必须开启以解决 CSA OOM）
+# 需要环境安装: flash_mla, nvidia-cudnn-frontend, fast-hadamard-transform
+APPLY_DSA_KERNEL_FUSION=false
+
+# ---- 8. MoE 监控 Callback ----
 # true  → 使用 run_recipe_with_monitor.py (注册 MoEMonitorCallback)
 # false → 使用官方 run_recipe.py (无 callback)
 MOE_MONITOR_ENABLED=true
@@ -129,6 +155,15 @@ fi
 CLI_OVERRIDES=" \
     model.seq_length=$SEQ_LENGTH \
     dataset.sequence_length=$SEQ_LENGTH \
+    model.attention_backend=$ATTENTION_BACKEND \
+    model.moe_permute_fusion=$MOE_PERMUTE_FUSION \
+    model.moe_grouped_gemm=$MOE_GROUPED_GEMM \
+    model.moe_shared_expert_overlap=$MOE_SHARED_EXPERT_OVERLAP \
+    model.recompute_granularity=$RECOMPUTE_GRANULARITY \
+    model.recompute_method=$RECOMPUTE_METHOD \
+    model.recompute_num_layers=$RECOMPUTE_NUM_LAYERS \
+    model.recompute_modules=$RECOMPUTE_MODULES \
+    model.apply_dsa_kernel_fusion=$APPLY_DSA_KERNEL_FUSION \
     train.train_iters=$TRAIN_ITERS \
     train.global_batch_size=$GLOBAL_BATCH_SIZE \
     train.micro_batch_size=$MICRO_BATCH_SIZE \
@@ -137,7 +172,7 @@ CLI_OVERRIDES=" \
     scheduler.lr_warmup_iters=$LR_WARMUP_ITERS \
     scheduler.lr_decay_iters=$TRAIN_ITERS \
     checkpoint.save=${CHECKPOINT_DIR} \
-    checkpoint.load=${CHECKPOINT_DIR} \
+    checkpoint.also_save_hf_checkpoint=true \
     checkpoint.save_interval=$SAVE_INTERVAL \
     checkpoint.most_recent_k=$CHECKPOINT_KEEP_LIMIT \
     logger.log_interval=$LOG_INTERVAL \
