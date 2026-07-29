@@ -1,156 +1,419 @@
-# SGLang 适配 DeepSeek-V4 裁剪模型 (head_dim=256) 修改记录
+# SGLang 适配 head_dim=256 裁剪版 DeepSeek V4 模型改动总结
 
 ## 背景
 
-裁剪后的 DeepSeek-V4 模型将 head_dim 从 512 缩减至 256（qk_nope_head_dim=192, qk_rope_head_dim=64）。
-SGLang 的 DSV4 后端针对 head_dim=512 做了大量硬编码优化，需要逐层解除限制。
+原始 DeepSeek V4 模型：`head_dim=512`, `qk_nope_head_dim=448`, `qk_rope_head_dim=64`  
+裁剪后模型：`head_dim=256`, `qk_nope_head_dim=192`, `qk_rope_head_dim=64`  
+运行环境：RTX 5090 (SM 12.0 / Blackwell)，SGLang v0.5.14
 
-## 验证结果
+---
 
-**服务已成功拉起。** 通过 `/data/dpsk-v4-run.sh` 启动后：
-- 服务健康检查通过（HTTP 200）
-- 请求时触发 "illegal instruction" CUDA 错误（已修复，见下方第二轮修改）
+## 改动 1：flash_mla_sm120.py — FlashMLA KV Cache 布局动态推导
 
-## 已完成的修改
+**文件路径**：`sglang/srt/layers/attention/flash_mla_sm120.py`
 
-### 1. Python 层断言移除
+### 问题
 
-| 文件 | 修改内容 |
-|------|----------|
-| `srt/mem_cache/deepseek_v4_memory_pool.py` | 移除 `assert bytes_per_token == 448 + 64*2 + 8` 硬编码断言 |
-| `srt/layers/attention/deepseek_v4_backend.py` | 移除 `assert head_dim == 512` 断言；添加 `qk_nope_head_dim`/`qk_rope_head_dim` 属性 |
-| `srt/layers/attention/dsv4/index_buf_accessor.py` | 移除 `NopeFp8RopeBf16Pack.__post_init__` 中 shape==448/64/7 的断言 |
+原始代码将所有 KV cache 页内布局常数硬编码为 DeepSeek V4 (head_dim=512) 的值：
 
-### 2. Triton kernel 参数化
+| 常数 | 原始硬编码值 | 裁剪模型实际值 |
+|------|-------------|--------------|
+| `_NOPE_DIM` | 448 | 192 |
+| `_NOPE_ROPE_STRIDE` | 576 | 256 |
+| `_NUM_TILES` | 7 | 3 |
+| `_SCALE_STRIDE` | 8 | 4 |
+| `_D` | 512 | 256 |
+| `bytes_per_token` | 584 | 324 |
 
-| 文件 | 修改内容 |
-|------|----------|
-| `srt/layers/attention/dsv4/quant_k_cache.py` | `quant_to_nope_fp8_rope_bf16_pack_triton()` 新增 `dim_nope`/`dim_rope` 参数，从输入 tensor shape 自动推导 |
-| `srt/layers/attention/dsv4/dequant_k_cache.py` | `dequantize_k_cache_paged()` 新增 `dim_nope`/`dim_rope` 参数，替代模块级常量 |
-| `srt/layers/attention/deepseek_v4_backend.py` | `dequantize_k_cache_paged` 调用处传入实际 dims；`store_cache()` 强制使用 triton quant 路径 |
+导致 `_gather_and_dequant` 函数在读取 FP8 KV cache 时地址越界，dequantize 结果全为 NaN，最终 logits 全为 NaN。
 
-### 3. JIT CUDA kernel 绕行（第一轮）
+### Diff
 
-| 文件 | 修改内容 |
-|------|----------|
-| `srt/models/deepseek_v4.py` | `_compute_q_b()` 对 head_dim!=512 使用 `fused_norm_rope_inplace_triton` 替代 JIT kernel |
-| `srt/models/deepseek_v4.py` | `_compute_kv_to_cache()` 改为使用 `fused_norm_rope_inplace_triton` + `store_cache()` 替代 JIT `fused_k_norm_rope_flashmla` |
-| `srt/layers/attention/dsv4/compressor_v2.py` | `forward_unified()` 强制走 `_forward_unified_hip` triton 路径；store 路径强制使用 triton quant |
+```diff
+--- a/sglang/srt/layers/attention/flash_mla_sm120.py
++++ b/sglang/srt/layers/attention/flash_mla_sm120.py
+@@ -18,21 +18,30 @@
+ logger = logging.getLogger(__name__)
+ 
+ # Page layout constants for DSv4-Flash (MODEL1):
+-#   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
+-#   nope_rope_stride = 448 + 64*2 = 576 bytes per token
+-#   scale_stride = ceil(448/64) + 1 = 8 bytes per token (7 scales + 1 pad)
+-#   bytes_per_token = 448 + 128 + 8 = 584
+-#   page_bytes = ceil_div(page_size * 584, 576) * 576
+-
+-_NOPE_DIM = 448
++# These are dynamically computed from the k_cache shape.
++# Original DSv4: nope_dim=448, rope_dim=64, head_dim=512, bytes_per_token=584
++# Pruned head_dim=256: nope_dim=192, rope_dim=64, head_dim=256, bytes_per_token=324
++
+ _ROPE_DIM = 64
+-_NOPE_ROPE_STRIDE = _NOPE_DIM + _ROPE_DIM * 2  # 576
+ _TILE_SIZE = 64
+-_NUM_TILES = _NOPE_DIM // _TILE_SIZE  # 7
+-_SCALE_STRIDE = _NUM_TILES + 1  # 8 (7 scales + 1 pad)
+-_D = _NOPE_DIM + _ROPE_DIM  # 512
+ 
+ 
++def _compute_layout(bytes_per_token: int):
++    """Compute page layout constants from bytes_per_token.
++
++    bytes_per_token = dim_nope + dim_rope*2 + (dim_nope // 64 + 1)
++    Since dim_nope = D - 64 and dim_nope must be divisible by 64:
++      bytes_per_token = D + 64 + D//64
++      => D = (bytes_per_token - 64) * 64 // 65
++    """
++    _D = (bytes_per_token - _ROPE_DIM) * _TILE_SIZE // (_TILE_SIZE + 1)
++    _NOPE_DIM = _D - _ROPE_DIM
++    _NOPE_ROPE_STRIDE = _NOPE_DIM + _ROPE_DIM * 2  # = _D
++    _NUM_TILES = _NOPE_DIM // _TILE_SIZE
++    _SCALE_STRIDE = _NUM_TILES + 1
++    return _NOPE_DIM, _NOPE_ROPE_STRIDE, _NUM_TILES, _SCALE_STRIDE, _D
++
++
+ def _gather_and_dequant(k_cache, indices, page_size):
+     """Gather KV entries from the paged buffer using correct page-internal addressing.
+ 
+@@ -45,6 +54,10 @@
+     Returns:
+         kv: (..., _D) bfloat16, dequantized KV vectors
+     """
++    # Compute layout dynamically from cache shape
++    bytes_per_token = k_cache.shape[3]
++    NOPE_DIM, NOPE_ROPE_STRIDE, NUM_TILES, SCALE_STRIDE, D = _compute_layout(bytes_per_token)
++
+     idx_shape = indices.shape
+     flat_idx = indices.reshape(-1)  # (N,)
+     N = flat_idx.shape[0]
+@@ -65,33 +78,33 @@
+     )  # (num_pages, page_bytes) uint8
+ 
+     # Compute byte offsets within each page
+-    # NOPE: page[safe_page, safe_offset * 576 + 0:448]
+-    # ROPE: page[safe_page, safe_offset * 576 + 448:576]
+-    # SCALES: page[safe_page, page_size * 576 + safe_offset * 8 + 0:7]
+-
+-    nope_base = safe_offsets * _NOPE_ROPE_STRIDE  # (N,)
++    nope_base = safe_offsets * NOPE_ROPE_STRIDE  # (N,)
+     nope_offsets = nope_base.unsqueeze(-1) + torch.arange(
+-        _NOPE_DIM, device=device, dtype=torch.long
+-    )  # (N, 448)
++        NOPE_DIM, device=device, dtype=torch.long
++    )  # (N, NOPE_DIM)
+ 
+-    rope_base = nope_base + _NOPE_DIM  # (N,)
++    rope_base = nope_base + NOPE_DIM  # (N,)
+     rope_offsets = rope_base.unsqueeze(-1) + torch.arange(
+         _ROPE_DIM * 2, device=device, dtype=torch.long
+-    )  # (N, 128)
++    )  # (N, ROPE_DIM*2)
+ 
+-    scale_section_offset = page_size * _NOPE_ROPE_STRIDE  # 147456
+-    scale_base = scale_section_offset + safe_offsets * _SCALE_STRIDE  # (N,)
++    scale_section_offset = page_size * NOPE_ROPE_STRIDE
++    scale_base = scale_section_offset + safe_offsets * SCALE_STRIDE  # (N,)
+     scale_offsets = scale_base.unsqueeze(-1) + torch.arange(
+-        _NUM_TILES, device=device, dtype=torch.long
+-    )  # (N, 7)
++        NUM_TILES, device=device, dtype=torch.long
++    )  # (N, NUM_TILES)
+ 
+     # Gather bytes per page
+     page_idx_nope = safe_pages.unsqueeze(-1).expand_as(nope_offsets)
+-    nope_bytes = raw_pages[page_idx_nope, nope_offsets]  # (N, 448) uint8
++    nope_bytes = raw_pages[page_idx_nope, nope_offsets]  # (N, NOPE_DIM)
+ 
+     page_idx_rope = safe_pages.unsqueeze(-1).expand_as(rope_offsets)
+-    rope_bytes = raw_pages[page_idx_rope, rope_offsets]  # (N, 128) uint8
++    rope_bytes = raw_pages[page_idx_rope, rope_offsets]  # (N, ROPE_DIM*2)
+ 
+     page_idx_scale = safe_pages.unsqueeze(-1).expand_as(scale_offsets)
+-    scale_bytes = raw_pages[page_idx_scale, scale_offsets]  # (N, 7) uint8
++    scale_bytes = raw_pages[page_idx_scale, scale_offsets]  # (N, NUM_TILES)
+ 
+     # Reinterpret dtypes
+-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, 448)
+-    rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, 64)
+-    scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (N, 7)
++    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, NOPE_DIM)
++    rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, ROPE_DIM)
++    scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (N, NUM_TILES)
+ 
+     # Dequantize: nope_tile * scale_tile → bf16 (vectorized)
+-    result = torch.empty(N, _D, dtype=torch.bfloat16, device=device)
+-    result[:, :_NOPE_DIM] = (
++    result = torch.empty(N, D, dtype=torch.bfloat16, device=device)
++    result[:, :NOPE_DIM] = (
+         (
+-            nope_fp8.view(N, _NUM_TILES, _TILE_SIZE).float()
+-            * scale_e8m0.view(N, _NUM_TILES, 1).float()
++            nope_fp8.view(N, NUM_TILES, _TILE_SIZE).float()
++            * scale_e8m0.view(N, NUM_TILES, 1).float()
+         )
+-        .view(N, _NOPE_DIM)
++        .view(N, NOPE_DIM)
+         .to(torch.bfloat16)
+     )
+-    result[:, _NOPE_DIM:] = rope_bf16
++    result[:, NOPE_DIM:] = rope_bf16
+ 
+-    return result.reshape(*idx_shape, _D)
++    return result.reshape(*idx_shape, D)
+```
 
-### 4. FlashMLA 预编译 kernel 绕行（PyTorch fallback）
+---
 
-| 文件 | 修改内容 |
-|------|----------|
-| `srt/layers/attention/deepseek_v4_backend.py` | 新增 `_forward_decode_pytorch_fallback()` 方法；decode 路径检测 `head_dim_k not in (512, 576)` 时走 fallback |
+## 改动 2：model_config.py — 修复 qk_rope_head_dim 读取
 
-**Fallback 实现逻辑**：
-1. 使用 `dequantize_k_cache_paged()` 将 FP8 paged KV cache 反量化为 BF16
-2. 拼接 SWA cache 和 extra (C4/C128) cache
-3. 使用 PyTorch einsum 计算 attention scores：`scores = einsum("bhd,bkd->bhk")`
-4. 应用 softmax_scale、attn_sink、length mask
-5. Softmax + einsum 计算输出：`o = einsum("bhk,bkd->bhd")`
+**文件路径**：`sglang/srt/configs/model_config.py`
 
-**关键修复**：
-- `swa_topk_lengths`/`extra_topk_lengths` 为 1D tensor `[batch_size]`，使用 `.view(-1)` 而非 `.squeeze(1)`
-- `extra_k_cache` 经 view 后非连续，使用 `.reshape().contiguous()` 确保内存连续
-- `swa_page_indices` 为 page-level block table，需展开为 token-level indices：`token_id = block_id * page_size + offset`
+### 问题
 
-### 5. JIT CUDA kernel 绕行（第二轮 — 修复请求崩溃）
+transformers 库的 `DeepseekV4Config.__post_init__` 通过 `int(head_dim * partial_rotary_factor)` 计算 `qk_rope_head_dim`。  
+原始模型 `partial_rotary_factor = 64/512 = 0.125`，裁剪后 `head_dim=256`，导致 `qk_rope_head_dim = int(256 * 0.125) = 32`（错误，应为 64）。
 
-服务拉起后请求时触发 "illegal instruction" CUDA 错误。根因：多个 JIT CUDA kernel 在 H20 GPU 上执行时产生非法指令。
-通过 `CUDA_LAUNCH_BLOCKING=1` 定位后，逐一替换为 PyTorch/Triton 等价实现。
+这会引起下游 attention 计算中 RoPE 维度不匹配，导致 reshape 错误和 logits 为 NaN。
 
-| 文件 | 修改内容 |
-|------|----------|
-| `jit_kernel/dsv4/compress.py` | `compress_forward()` 对 head_dim!=512 路由到 `_compress_forward_pytorch()` PyTorch fallback；优化 plan 数据预取到 CPU 避免逐元素 `.item()` CUDA 同步 |
-| `srt/layers/attention/dsv4/indexer.py` | 新增 `_fused_q_indexer_rope_hadamard_quant_pytorch()` 函数（RoPE + Hadamard + FP8 quant）；`C4Indexer.compute_q()` 使用该 fallback 替代 JIT kernel |
-| `srt/layers/attention/dsv4/indexer.py` | `topk_transform_512` 强制使用 `topk_transform_512_pytorch_vectorized` PyTorch fallback |
-| `srt/layers/attention/dsa/dsa_indexer.py` | 新增 `_hadamard_pytorch()` 函数（Fast Walsh-Hadamard Transform）；`rotate_activation()` 使用该 fallback 替代 JIT `hadamard_transform` |
+### Diff
 
-**`_fused_q_indexer_rope_hadamard_quant_pytorch` 实现逻辑**：
-1. RoPE：对 q 的最后 rope_dim=64 维应用旋转位置编码
-2. Hadamard：128 点 Fast Walsh-Hadamard 变换（无归一化）
-3. FP8 量化：per-(token, head) 计算 max_abs → scale → clamp → float8_e4m3fn
-4. 权重输出：`weights_out = weight * weight_scale * q_scale`
+```diff
+--- a/sglang/srt/configs/model_config.py
++++ b/sglang/srt/configs/model_config.py
+@@ -772,7 +772,34 @@
+         elif (
+             "DeepseekV4ForCausalLM" in self.hf_config.architectures
+             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+         ):
+-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
++            # transformers DeepseekV4Config computes qk_rope_head_dim as
++            # int(head_dim * partial_rotary_factor), which can be wrong for
++            # pruned models where head_dim changed but partial_rotary_factor
++            # wasn't updated. Read the raw value from config.json.
++            raw_qk_rope = None
++            try:
++                import json as _json
++                import os as _os
++
++                cfg_path = _os.path.join(self.model_path, "config.json")
++                if _os.path.isfile(cfg_path):
++                    with open(cfg_path) as f:
++                        raw_cfg = _json.load(f)
++                    raw_qk_rope = raw_cfg.get("qk_rope_head_dim")
++            except Exception:
++                pass
++            if raw_qk_rope is not None:
++                self.qk_rope_head_dim = int(raw_qk_rope)
++                # Fix the HF config object so downstream code sees the right value
++                self.hf_config.qk_rope_head_dim = self.qk_rope_head_dim
++                if self.hf_config is not self.hf_text_config:
++                    self.hf_text_config.qk_rope_head_dim = self.qk_rope_head_dim
++                # Also fix partial_rotary_factor for consistency
++                self.hf_config.partial_rotary_factor = (
++                    self.qk_rope_head_dim / self.hf_config.head_dim
++                )
++            else:
++                self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+             self.window_size = self.hf_config.sliding_window
+             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+```
 
-**`_compress_forward_pytorch` 实现逻辑**：
-- Decode：从 plan_d 解析 write_loc/read_page，写入新 token，boundary 处做 softmax 加权压缩
-- Prefill：从 plan_w 写入新 token 到 buffer，从 plan_c 读取 page 做 softmax 加权压缩
+---
 
-### 6. 修改原因
+## 改动 3：sgl_infer_dpsk_v4.sh — 禁用 Triton 内核，使用 PyTorch fallback
 
-SGLang DSV4 后端有多层 JIT CUDA kernel：
-- `main_norm_rope.cuh` — `FusedKNormRopeFlashMLAKernel`: 硬编码 `kHeadDim == 512`
-- `main_norm_rope.cuh` — `FusedQIndexerRopeHadamardQuantKernel`: 硬编码 `kHeadDim == 128, kRopeDim == 64`
-- `c4.cuh` / `c128.cuh` — `FlashCompress4/128Kernel`: 压缩 kernel
-- `fused_norm_rope.cuh` — `FusedNormRopeKernel`: 压缩后 norm+rope
-- `hadamard.cuh` — Hadamard 变换
+**文件路径**：`sgl_infer_dpsk_v4.sh`
 
-FlashMLA 预编译二进制 kernel（`flashmla_ops.abi3.so`）：
-- `sparse_decode_fwd`: 仅支持 head_size_k == 512 或 576
-- `sparse_prefill_fwd`: 同上
+### 问题
 
-在 H20 GPU (sm_90) 上，部分 JIT kernel 即使编译通过也会在执行时触发 "illegal instruction"。
-所有 JIT kernel 均通过 Python 层绕行到 PyTorch/Triton 等价实现。
+`flash_mla_sm120_triton.py` 中的 Triton kernel 同样硬编码了 `head_dim=512` 的页内布局（Triton `constexpr` 常量在编译期确定），无法适配裁剪模型。
 
-## FlashMLA 分析
+### Diff
 
-### 是否使用 FlashMLA？
+```diff
+--- a/sgl_infer_dpsk_v4.sh
++++ b/sgl_infer_dpsk_v4.sh
+@@ -16,6 +16,7 @@
+ # export SGLANG_DSV4_FP4_EXPERTS=0  # 关闭 FP4 expert 路径
+ export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0
++export SGLANG_SM120_TRITON_FLASHMLA=0  # 使用 PyTorch fallback，避免 Triton 内核的硬编码 head_dim=512 布局
+```
 
-**是。** 虚拟环境 `/data/dpsk-v4/` 中的 `sgl_kernel` 包含预编译的 `flashmla_ops.abi3.so`（14MB），
-通过 `torch.ops.sgl_kernel.sparse_decode_fwd` / `sparse_prefill_fwd` 调用。
+---
 
-`SGLANG_DISABLE_JIT_KERNEL=1` 环境变量在 SGLang 代码中**不存在**，无任何效果。
+## 改动总结
 
-### 实际 MLA 逻辑路径
+| # | 文件 | 改动类型 | 说明 |
+|---|------|---------|------|
+| 1 | `sglang/srt/layers/attention/flash_mla_sm120.py` | 核心修复 | 将硬编码的 KV cache 页内布局常数改为从 `bytes_per_token` 动态推导，新增 `_compute_layout()` 函数 |
+| 2 | `sglang/srt/configs/model_config.py` | 配置修复 | DeepseekV4 分支新增从 `config.json` 直接读取 `qk_rope_head_dim` 的逻辑，绕过 transformers 的错误计算 |
+| 3 | `sgl_infer_dpsk_v4.sh` | 启动脚本 | 添加 `SGLANG_SM120_TRITON_FLASHMLA=0` 环境变量，禁用同样有硬编码问题的 Triton 内核 |
+
+## 布局公式推导
+
+对于 DeepSeek V4 系列 FP8 KV cache，每 token 字节数公式为：
 
 ```
-forward() → _forward_decode_pytorch_fallback()  [head_dim=256 时]
-         → flash_mla_with_kvcache()             [head_dim=512/576 时]
-             → torch.ops.sgl_kernel.sparse_decode_fwd  (预编译 CUDA)
+bytes_per_token = D + ROPE_DIM + NOPE_DIM // TILE_SIZE + 1
 ```
 
-## 修改文件清单
+其中 `NOPE_DIM = D - ROPE_DIM`，且 `NOPE_DIM` 必须被 `TILE_SIZE(64)` 整除，化简为：
 
 ```
-/usr/local/lib/python3.12/dist-packages/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/deepseek_v4_backend.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/dsv4/index_buf_accessor.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/dsv4/quant_k_cache.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/dsv4/dequant_k_cache.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/dsv4/compressor_v2.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/dsv4/indexer.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/dsa/dsa_indexer.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/deepseek_v4_rope.py
-/usr/local/lib/python3.12/dist-packages/sglang/srt/models/deepseek_v4.py
-/usr/local/lib/python3.12/dist-packages/sglang/jit_kernel/dsv4/compress.py
+bytes_per_token = D + 64 + D // 64
 ```
 
-## 性能说明
+反解 D：
 
-PyTorch fallback 使用纯 PyTorch 算子实现，相比 JIT CUDA kernel：
-- 无 kernel fusion（多步操作分离执行）
-- 无 warp-level 优化（Hadamard 使用 tensor view 而非 shuffle）
-- 适用于验证和功能测试，不适合生产部署
-
-生产环境建议：
-- 向 sgl_kernel 上游提交 head_dim=256 支持
-- 或实现 triton-based sparse MLA attention kernel
-- 或修复 H20 上 JIT kernel 的 "illegal instruction" 问题（可能是 PDL 相关）
-
-## 测试方法
-
-```bash
-# 启动服务（建议加 CUDA_LAUNCH_BLOCKING=1 便于调试）
-source /data/dpsk-v4/bin/activate
-export CUDA_LAUNCH_BLOCKING=1
-sglang serve --trust-remote-code --model-path /data/output/v4-pruned-nas-final-sglang \
-  --tp 4 --moe-runner-backend marlin --disable-cuda-graph \
-  --mem-fraction-static 0.75 --served-model-name dpsk_v4_width \
-  --host 0.0.0.0 --port 30001
-
-# 测试请求
-curl http://localhost:30001/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"dpsk_v4_width","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
 ```
+D = (bytes_per_token - 64) * 64 // 65
+```
+
+验证：
+- 原始 DSv4：`bytes_per_token=584` → `D = (584-64)*64//65 = 512` ✓
+- 裁剪模型：`bytes_per_token=324` → `D = (324-64)*64//65 = 256` ✓
+
+---
+
+# 附录：H20 (SM90) 环境的额外适配
+
+> 以上改动 1~3 均针对 **RTX 5090 (SM 12.0 / Blackwell)** 验证。
+> 将同一 conda 环境迁移到 **H20 (SM 9.0 / Hopper)** 部署裁剪模型时，会遇到新的报错，
+> 需要以下额外适配。原始改动 1~3 依然保留（H20 仍复用改动 1 的动态 layout 逻辑）。
+
+## 背景：SM120 与 SM90 走不同的 attention 代码路径
+
+运行环境：NVIDIA H20 (SM 9.0 / Hopper)，SGLang v0.5.14
+
+H20 部署裁剪模型（head_dim=256）报错：
+
+```
+File ".../sgl_kernel/flash_mla.py", line 269, in _flash_mla_with_kvcache_sched_meta
+    torch.ops.sgl_kernel.sparse_decode_fwd.default(...)
+RuntimeError: Only head_size_k == 576 or 512 is supported for sparse decoding
+```
+
+根因在 `deepseek_v4_backend.py` 的架构分发逻辑：
+
+```python
+# line 71
+_is_sm120 = is_sm120_supported()
+
+# line 1414 (decode 路径)
+if _is_sm120:                                    # RTX 5090 → True
+    from ...flash_mla_sm120 import flash_mla_with_kvcache_sm120
+    o = flash_mla_with_kvcache_sm120(...)        # 纯 PyTorch，可 patch (改动 1)
+else:                                            # H20 → False
+    import sgl_kernel.flash_mla as flash_mla
+    o = flash_mla.flash_mla_with_kvcache(...)    # 编译型 CUDA kernel，硬编码 head_size_k==576/512
+```
+
+| | 源 (5090/SM120) | 目标 (H20/SM90) |
+|---|---|---|
+| `_is_sm120` | True | False |
+| 走的路径 | `flash_mla_sm120.py`（纯 PyTorch，改动 1 生效） | `sgl_kernel.sparse_decode_fwd`（编译型，硬编码 576/512） |
+| 裁剪模型 (head_dim=256) | 能跑 | 报 `head_size_k` 错误 |
+
+改动 1~3 的 patch 全部位于 SM120 的纯 PyTorch 路径，H20 默认根本不走那条路，
+而是走编译好的 `sparse_decode_fwd` CUDA kernel（无法通过改 Python 源码修复）。
+
+---
+
+## 改动 4：deepseek_v4_backend.py — 允许强制走 SM120 纯 PyTorch 路径
+
+**文件路径**：`sglang/srt/layers/attention/deepseek_v4_backend.py`
+
+### 问题
+
+H20 (SM90) 默认走编译型 `sparse_decode_fwd`，硬编码 `head_size_k==576/512`，裁剪模型 (256) 被拒绝。
+而 `flash_mla_with_kvcache_sm120` 的 torch 后端 (`_sm120_sparse_decode_fwd`) 是**纯 PyTorch、设备无关**实现，
+H20 上同样能跑（只是比编译 kernel 慢）。因此只需让 H20 也进 `if _is_sm120:` 分支。
+
+### Diff
+
+```diff
+--- a/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -71 +71,3 @@
+-_is_sm120 = is_sm120_supported()
++import os as _os
++# 允许通过环境变量强制走 SM120 纯 PyTorch 路径（供 H20/SM90 部署裁剪模型使用）
++_is_sm120 = is_sm120_supported() or _os.environ.get("SGLANG_FORCE_SM120_FLASHMLA", "0") == "1"
+```
+
+### 一致性说明
+
+`_is_sm120` 在该文件有两处用到，强制 True 后均自洽：
+
+| 位置 | 强制 True 后行为 | 是否正确 |
+|------|-----------------|---------|
+| line 123 `_create_flashmla_metadata()` | 返回 `None` | SM120 路径本就不用 metadata |
+| line 1414 decode 分支 | 走 `flash_mla_with_kvcache_sm120`（纯 PyTorch） | 设备无关，H20 能跑 |
+
+SM120 的 decode 分支直接用 `indices` / `topk_length`，不依赖 `flashmla_metadata`，因此 line 123 返回 `None` 无影响。
+
+---
+
+## 改动 5：启动脚本 — H20 专用环境变量
+
+**文件路径**：H20 上的 SGLang 启动脚本（如 `sgl_infer_dpsk_v4.sh`）
+
+### Diff
+
+```diff
++# ---- H20 (SM90) 专用：强制走 SM120 纯 PyTorch fallback ----
++export SGLANG_FORCE_SM120_FLASHMLA=1   # 让 H20 的 _is_sm120=True，绕开编译型 sparse_decode_fwd
++export SGLANG_SM120_TRITON_FLASHMLA=0  # 在 SM120 分支内选纯 PyTorch，不用 Triton（Triton 有硬编码 head_dim=512）
+```
+
+| 环境变量 | 作用 |
+|---|---|
+| `SGLANG_FORCE_SM120_FLASHMLA=1` | 配合改动 4，让 H20 进 SM120 分支 |
+| `SGLANG_SM120_TRITON_FLASHMLA=0` | 选纯 PyTorch `_sm120_sparse_decode_fwd`（改动 1 已 patch），避开硬编码的 Triton kernel |
+
+---
+
+## 改动 6：启动参数 — H20 禁用 CUDA graph
+
+**文件路径**：H20 上的 SGLang 启动脚本
+
+### 问题
+
+强制走的 `_sm120_sparse_decode_fwd` 是纯 PyTorch + 数据依赖的 gather/index 操作，
+与 SGLang 启动时的 **CUDA graph 捕获（prewarm）不兼容**，会在启动阶段卡死
+（日志停在 `cutlass.cute.experimental` 警告后，GPU util 长时间无进展，收不到请求也不报错）。
+
+### Diff
+
+```diff
++# H20 纯 PyTorch sparse decode 与 CUDA graph 捕获不兼容，必须禁用
++--disable-cuda-graph
+```
+
+禁用后走 eager 执行，虽更慢，但纯 PyTorch 路径本就慢，先保证能跑通。
+
+---
+
+## H20 适配总结
+
+| # | 文件 / 位置 | 改动类型 | 说明 |
+|---|------|---------|------|
+| 4 | `sglang/srt/layers/attention/deepseek_v4_backend.py` (line 71) | 分发修复 | `_is_sm120` 增加 `SGLANG_FORCE_SM120_FLASHMLA` 环境变量开关，让 H20 也走 SM120 纯 PyTorch 路径 |
+| 5 | H20 启动脚本 | 环境变量 | `SGLANG_FORCE_SM120_FLASHMLA=1` + `SGLANG_SM120_TRITON_FLASHMLA=0` |
+| 6 | H20 启动脚本 | 启动参数 | `--disable-cuda-graph`，避免纯 PyTorch sparse decode 在 CUDA graph 捕获时卡死 |
+
+### 部署验证顺序（H20）
+
+1. 按改动 4 修改 `deepseek_v4_backend.py`（改前先备份 `.bak`）
+2. 启动脚本加改动 5 的两个环境变量 + 改动 6 的 `--disable-cuda-graph`
+3. 启动后发 1 条请求小并发验证：不再报 `head_size_k==576/512`，输出正常（logits 非 NaN）
+4. 确认正确性后再上量
+
+### 硬件差异对照
+
+| 项 | RTX 5090 | H20 |
+|---|---|---|
+| Compute Capability | 12.0 (SM120 / Blackwell) | 9.0 (SM90 / Hopper) |
+| `_is_sm120`（默认） | True | False（需改动 4 强制 True） |
+| sparse decode 实现 | SM120 纯 PyTorch / Triton | 默认编译 kernel（硬编码）→ 改后用 SM120 纯 PyTorch |
+| CUDA graph | 可用 | 纯 PyTorch 路径需禁用 |
